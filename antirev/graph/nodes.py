@@ -56,7 +56,8 @@ def make_planner(client, logger=None):
     return planner_node
 
 
-def make_executor(client, logger=None, max_steps=25, deadline=None, db_path=None):
+def make_executor(client, logger=None, max_steps=25, deadline=None, db_path=None,
+                  stuck_seconds=None, progress=None):
     def executor_node(state):
         binary = state["binary"]
         remaining = (deadline - time.time()) if deadline else None
@@ -65,7 +66,8 @@ def make_executor(client, logger=None, max_steps=25, deadline=None, db_path=None
         task = (f"题目文件: {binary}\n\n## 预分析\n{_fmt_pre(state.get('pre_analysis', {}))}\n\n"
                 f"## Plan\n{state.get('plan', '')}\n\n按 Plan 解出 flag,拿到后用 FINAL 输出。")
         ex = ReactExecutor(binary, client=client, logger=logger, max_steps=max_steps,
-                           time_budget=remaining, db_path=db_path)   # 跨轮共享缓存 db_path
+                           time_budget=remaining, db_path=db_path,   # 跨轮共享缓存 db_path
+                           stuck_seconds=stuck_seconds, progress=progress)  # 跨轮共享 stuck 追踪
         result = ex.run(task)
         ev = list(state.get("evidence", []))
         ev.append({"replan": state.get("replan_count", 0), "steps": result.get("steps"),
@@ -81,12 +83,14 @@ def make_executor(client, logger=None, max_steps=25, deadline=None, db_path=None
     return executor_node
 
 
-def make_router(max_replan=9, deadline=None):
+def make_router(max_replan=9, deadline=None, stuck_seconds=None, progress=None):
     def route_after_executor(state):
         if state.get("flag"):
             return "done"
         if deadline and time.time() > deadline:      # 全局时间预算到点
             return "fail"
+        if stuck_seconds and progress and time.time() - progress.get("last", time.time()) > stuck_seconds:
+            return "fail"                            # 10min无新进展,提前判失败
         if state.get("replan_count", 0) <= max_replan:
             return "replan"
         return "fail"

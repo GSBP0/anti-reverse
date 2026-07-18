@@ -96,13 +96,14 @@ def score(my_flag, truth: set) -> bool:
     return any(m == norm(t) or norm(t) in m or m in norm(t) for t in truth)
 
 
-def run_one(binary: Path, run_id: str, budget: int) -> dict:
+def run_one(binary: Path, run_id: str, budget: int, stuck: int = 600) -> dict:
     t = time.time()
-    # 全局预算=budget(跨10轮共享);子进程硬超时留 +40s 余量,好让全局 deadline 先优雅触发
+    # 20轮/30步, 全局预算=budget, stuck=无进展早停秒数; 子进程硬超时留 +60s 余量
     try:
         p = subprocess.run(
-            [sys.executable, "-m", "antirev.solve_one", str(binary), run_id, "9", "15", str(budget)],
-            capture_output=True, text=True, timeout=budget + 40, cwd=str(ROOT))
+            [sys.executable, "-m", "antirev.solve_one", str(binary), run_id,
+             "19", "30", str(budget), str(stuck)],
+            capture_output=True, text=True, timeout=budget + 60, cwd=str(ROOT))
         dt = time.time() - t
         for ln in reversed(p.stdout.splitlines()):
             if ln.startswith("__RESULT__"):
@@ -130,7 +131,9 @@ def steps_from_log(run_id: str) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="train_set_1")
-    ap.add_argument("--budget", type=int, default=360)
+    ap.add_argument("--budget", type=int, default=3600)     # 单题上限1h
+    ap.add_argument("--stuck", type=int, default=600)       # 10min无进展早停
+    ap.add_argument("--round", type=int, default=1)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--only", default="")
     args = ap.parse_args()
@@ -148,16 +151,28 @@ def main():
     if args.limit:
         problems = problems[:args.limit]
 
-    out_path = config.LOG_DIR / f"eval_{args.split}.jsonl"
+    out_path = config.LOG_DIR / f"eval_{args.split}_r{args.round}.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    results = []
-    solved = 0
-    print(f"# 评估 {len(problems)} 题, budget={args.budget}s/题\n")
+    # 断点续跑:跳过本轮已完成的题
+    done_pids, results, solved = set(), [], 0
+    if out_path.exists():
+        for ln in out_path.read_text(errors="ignore").splitlines():
+            try:
+                rec = json.loads(ln)
+                done_pids.add(rec["pid"])
+                results.append(rec)
+                solved += rec.get("solved", False)
+            except Exception:
+                pass
+    print(f"# 第{args.round}轮评估 {len(problems)} 题, budget={args.budget}s/题, "
+          f"stuck={args.stuck}s (已完成{len(done_pids)}题跳过)\n")
     for i, pdir in enumerate(problems, 1):
         pid = pdir.name.split("_")[0]
+        if pid in done_pids:
+            continue
         binary = pick_binary(pdir)
         truth = ground_truth(pdir)
-        run_id = f"eval_{pid}"
+        run_id = f"eval_r{args.round}_{pid}"
         fmt = file_info(binary)["format"] if binary else None
         if not binary:
             rec = {"pid": pid, "title": pdir.name, "status": "no_binary",
@@ -167,7 +182,7 @@ def main():
             rec = {"pid": pid, "title": pdir.name, "binary": binary.name, "format": fmt,
                    "status": "out_of_scope", "solved": False, "has_truth": bool(truth)}
         else:
-            r = run_one(binary, run_id, args.budget)
+            r = run_one(binary, run_id, args.budget, args.stuck)
             ok = score(r.get("flag"), truth)
             rec = {"pid": pid, "title": pdir.name, "binary": binary.name,
                    "my_flag": r.get("flag"), "truth": sorted(truth)[:3], "has_truth": bool(truth),

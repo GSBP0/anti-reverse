@@ -13,13 +13,14 @@ from antirev.graph.build import solve
 def main():
     binary = sys.argv[1]
     run_id = sys.argv[2] if len(sys.argv) > 2 else "eval"
-    max_replan = int(sys.argv[3]) if len(sys.argv) > 3 else 9
-    max_steps = int(sys.argv[4]) if len(sys.argv) > 4 else 15
-    budget = int(sys.argv[5]) if len(sys.argv) > 5 else None
+    max_replan = int(sys.argv[3]) if len(sys.argv) > 3 else 19    # 20 轮 planner↔executor
+    max_steps = int(sys.argv[4]) if len(sys.argv) > 4 else 30     # 每轮 executor 最多 30 tool call
+    budget = int(sys.argv[5]) if len(sys.argv) > 5 else None      # 单题总时长上限(秒)
+    stuck_seconds = int(sys.argv[6]) if len(sys.argv) > 6 else 600  # 无新进展 10min → 提前判失败
     logger = RunLogger(run_id=run_id, log_dir=config.LOG_DIR)
     try:
         r = solve(binary, logger=logger, max_replan=max_replan, max_steps=max_steps,
-                  budget=budget)
+                  budget=budget, stuck_seconds=stuck_seconds)
     except Exception as e:
         r = {"flag": None, "status": "error", "error": repr(e)[:300]}
     sys.stdout.write("\n__RESULT__" + json.dumps(r, ensure_ascii=False) + "\n")

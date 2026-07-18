@@ -130,13 +130,16 @@ class ChatClient:
 
 class ReactExecutor:
     def __init__(self, binary, client=None, logger=None, max_steps=60, window=6, db_path=None,
-                 time_budget=None):
+                 time_budget=None, stuck_seconds=None, progress=None):
         self.binary = binary
         self.client = client or ChatClient()
         self.logger = logger
         self.max_steps = max_steps
         self.window = window
         self.time_budget = time_budget    # 秒;超预算优雅停止(§11),在子进程硬超时前保住日志
+        self.stuck_seconds = stuck_seconds  # 超此秒数无"新进展"(疑似卡错误方向不自纠)→ 提前判失败
+        # progress 跨轮共享:{"last": 上次新进展时刻, "seen": 已见过的(工具,摘要)签名集}
+        self._progress = progress if progress is not None else {"last": None, "seen": set()}
         self.run_id = getattr(logger, "run_id", None) or "exec"
         self.db_path = db_path or ":memory:"
         self.active_binary = binary   # 脱壳后会切到 .unpacked
@@ -244,11 +247,19 @@ class ReactExecutor:
         ctx.set_goal(plan[:200])
         last_sig, repeat, last_tool, tool_run = None, 0, None, 0
         start = time.time()
+        if self._progress.get("last") is None:
+            self._progress["last"] = start
         try:
             for step in range(1, self.max_steps + 1):
                 if self.time_budget and time.time() - start > self.time_budget:
                     self._log("time_budget_exceeded", step=step)
                     return {"flag": None, "steps": step, "error": "超时间预算",
+                            "state": self.state, "trace": ctx.step_notes[-15:]}
+                if self.stuck_seconds and time.time() - self._progress["last"] > self.stuck_seconds:
+                    self._log("stuck_no_progress", step=step,
+                              secs=int(time.time() - self._progress["last"]))
+                    return {"flag": None, "steps": step,
+                            "error": f"{int(self.stuck_seconds // 60)}min无新进展(疑似卡错误方向,提前判失败)",
                             "state": self.state, "trace": ctx.step_notes[-15:]}
                 messages = ctx.build_messages(SYSTEM_PROMPT, plan)  # 有界:system+WM+最近window步
                 text = self.client.complete(messages)
@@ -278,7 +289,12 @@ class ReactExecutor:
                     last_tool = tool
                     obs = self._dispatch(tool, args, store)
                     self._log("tool_result", step=step, tool=tool, args=args, obs=obs)
-                    obs_txt = ctx.record(step, tool, args, obs)  # 压缩+存全量,返回上下文视图
+                    obs_txt = ctx.record(step, tool, args, obs)
+                    # 新进展检测:非错误且首次见到的(工具+摘要签名)→ 刷新进展时刻
+                    sig = f"{tool}:{ctx._brief(tool, obs)}"
+                    if not (isinstance(obs, dict) and obs.get("error")) and sig not in self._progress["seen"]:
+                        self._progress["seen"].add(sig)
+                        self._progress["last"] = time.time()  # 压缩+存全量,返回上下文视图
                     if repeat >= 2 or tool_run >= 4:  # 无进展检测(§3.4/§11)
                         self._log("no_progress", step=step, tool=tool)
                         obs_txt += ("\n\n[系统提示] 你在无进展地重复。停!换完全不同的思路:"
