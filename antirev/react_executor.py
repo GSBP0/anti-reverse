@@ -30,13 +30,15 @@ from antirev.tools.terminal import terminal as _run_terminal
 from antirev.tools.run_code import run_python as _run_python
 
 TOOL_SPEC = """可用工具(每步只调一个):
-- ida_decompile   args:{"name_or_addr":"main|0x.."}      反编译一个函数看逻辑(先看 main)
-- ida_read_bytes  args:{"name_or_addr":"enc|0x..","size":N} 读密文/密钥等原始字节(返回 hex)
+- ida_list_functions args:{"filter":"可选子串"}          列出函数(名+地址)。找不到某函数名时用它定位!
+- ida_decompile   args:{"name_or_addr":"main|0x.."}      反编译一个函数。返回 pseudocode + data_refs(引用的数据真实地址)
+                                                         + callees(调用的函数名+地址)。顺 callees 逐层深入(如 main→check_flag)
+- ida_read_bytes  args:{"name_or_addr":"0x..","size":N}  读密文/密钥等原始字节(返回 hex)。**按 data_refs 给的真实地址读,别用伪代码显示名**
 - run_python      args:{"code":"<python>"}                跑你写的解题脚本(有 pwntools/z3;变量 BINARY 是题目路径)
 - solve_locate    args:{}                                确定性定位成功/失败分支地址
 - solve_angr      args:{"stdin_len":N}                    符号执行求输入(自动用已定位 find/avoid)
 - solve_verify    args:{}                                把上一步 angr 候选喂回二进制自验
-- terminal        args:{"command":"..."}                 杂项命令"""
+- terminal        args:{"command":"..."}                 杂项命令(注:python 是系统解释器,无 ida 模块)"""
 
 SYSTEM_PROMPT = f"""你是逆向 Executor,目标是解出 flag。按题选两条通用路线之一:
 (A) 读懂算法→写逆运算:先 ida_decompile 读 main/校验逻辑。若是可逆算法(异或/base64/移位/TEA/XTEA/RC4…),
@@ -111,7 +113,7 @@ class ChatClient:
 
 
 class ReactExecutor:
-    def __init__(self, binary, client=None, logger=None, max_steps=30):
+    def __init__(self, binary, client=None, logger=None, max_steps=60):
         self.binary = binary
         self.client = client or ChatClient()
         self.logger = logger
@@ -124,11 +126,18 @@ class ReactExecutor:
 
     def _dispatch(self, tool, args):
         try:
+            if tool == "ida_list_functions":
+                with IdaSession(self.binary) as ida:
+                    fns = ida.list_functions(args.get("filter"))
+                    return {"count": len(fns),
+                            "functions": [{"addr": hex(f["addr"]), "name": f["name"],
+                                           "size": f["size"]} for f in fns[:500]]}
             if tool == "ida_decompile":
                 with IdaSession(self.binary) as ida:
                     r = ida.decompile(args["name_or_addr"])
                     return {"pseudocode": r["pseudocode"][:5000],
-                            "data_refs": r.get("data_refs", [])}
+                            "data_refs": r.get("data_refs", []),
+                            "callees": r.get("callees", [])}
             if tool == "ida_read_bytes":
                 with IdaSession(self.binary) as ida:
                     return ida.get_bytes(args["name_or_addr"], int(args["size"]))
@@ -166,6 +175,7 @@ class ReactExecutor:
         messages = [{"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": plan}]
         last_sig, repeat = None, 0
+        last_tool, tool_run = None, 0
         for step in range(1, self.max_steps + 1):
             text = self.client.complete(messages)
             self._log("executor_output", step=step, text=text[:800])
@@ -178,16 +188,20 @@ class ReactExecutor:
                 sig = json.dumps(payload, sort_keys=True, ensure_ascii=False)
                 repeat = repeat + 1 if sig == last_sig else 0
                 last_sig = sig
+                tool_run = tool_run + 1 if tool == last_tool else 0
+                last_tool = tool
                 obs = self._dispatch(tool, args)
                 self._log("tool_result", step=step, tool=tool, args=args, obs=obs)
                 messages.append({"role": "assistant", "content": text})
                 obs_txt = f"OBSERVATION: {json.dumps(obs, ensure_ascii=False)[:6000]}"
-                if repeat >= 2:  # 无进展检测:连续第3次相同动作 → 强打断,逼换思路(§3.4/§11)
+                # 无进展检测(§3.4/§11):同一动作重复,或同一工具连刷多次(如瞎猜地址) → 强打断
+                if repeat >= 2 or tool_run >= 4:
                     self._log("no_progress", step=step, tool=tool)
-                    obs_txt += ("\n\n[系统提示] 你已连续重复相同操作且无进展,停止重复!换完全不同的思路:"
-                                "数据要按**真实地址**(见 data_refs,不是伪代码显示名)read_bytes;"
-                                "或改用 run_python 写脚本;或换 solve_angr。")
-                    repeat = 0
+                    obs_txt += ("\n\n[系统提示] 你在无进展地重复。停!换完全不同的思路:"
+                                "找不到函数就用 ida_list_functions 列全部函数按名定位;"
+                                "读数据按 data_refs 的真实地址(别用伪代码显示名);"
+                                "读懂算法后用 run_python 写逆运算脚本;或试 solve_angr。别再瞎猜地址。")
+                    repeat, tool_run = 0, 0
                 messages.append({"role": "user", "content": obs_txt})
             else:
                 messages.append({"role": "assistant", "content": text})

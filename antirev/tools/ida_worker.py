@@ -79,19 +79,24 @@ def _handle(cmd, a, mods):
         # 附带函数内引用的数据地址(全局常量/密文/串) —— 伪代码里的 enc_0 显示名未必可解析,
         # 给出真实地址+预览,模型才能按地址 read_bytes(这是"读算法→取常量"流程的关键)
         f = ida_funcs.get_func(ea)
-        drefs, seen = [], set()
+        drefs, dseen = [], set()
+        callees, cseen = [], set()   # 调用的函数(名+地址),供模型顺调用图导航(如 main→check_flag)
         if f:
             for item in idautils.FuncItems(f.start_ea):
                 for d in idautils.DataRefsFrom(item):
-                    if d in seen:
-                        continue
-                    seen.add(d)
-                    b = ida_bytes.get_bytes(d, 16) or b""
-                    drefs.append({"addr": hex(int(d)), "name": idc.get_name(d) or "",
-                                  "preview_hex": b.hex(),
-                                  "preview_ascii": "".join(chr(c) if 32 <= c < 127 else "." for c in b)})
+                    if d not in dseen:
+                        dseen.add(d)
+                        b = ida_bytes.get_bytes(d, 16) or b""
+                        drefs.append({"addr": hex(int(d)), "name": idc.get_name(d) or "",
+                                      "preview_hex": b.hex(),
+                                      "preview_ascii": "".join(chr(c) if 32 <= c < 127 else "." for c in b)})
+                for cr in idautils.CodeRefsFrom(item, 0):   # 0: 仅跳转/调用,不含顺序流
+                    cfn = ida_funcs.get_func(cr)
+                    if cfn and cfn.start_ea == cr and cr != f.start_ea and cr not in cseen:
+                        cseen.add(cr)
+                        callees.append({"addr": hex(int(cr)), "name": idc.get_func_name(cr)})
         return {"addr": int(ea), "name": idc.get_func_name(ea),
-                "pseudocode": str(cf), "data_refs": drefs}
+                "pseudocode": str(cf), "data_refs": drefs, "callees": callees}
     if cmd == "strings":
         import re
         rx = re.compile(a["filter"], re.I) if a.get("filter") else None
