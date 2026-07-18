@@ -44,6 +44,26 @@ def test_parse_garbage_returns_none():
     assert kind is None
 
 
+def test_rejects_hallucinated_flag_accepts_grounded(sample):
+    """反假阳性:编造的 flag(未在工具输出出现)被拒;run_python 真实算出的被接受。"""
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, messages, **kw):
+            self.calls += 1
+            if self.calls == 1:
+                return "FINAL: flag{fabricated_never_seen_anywhere}"     # 编造 → 应被拒
+            if self.calls == 2:
+                return 'ACTION: {"tool":"run_python","args":{"code":"print(\'flag{real_computed_123}\')"}}'
+            return "FINAL: flag{real_computed_123}"                      # 有工具佐证 → 接受
+
+    ex = ReactExecutor(sample, client=FakeClient(), max_steps=6)
+    r = ex.run("solve it")
+    assert r["flag"] == "flag{real_computed_123}"
+    assert r["steps"] >= 3       # 第1次编造被拒,继续到真实算出
+
+
 @pytest.mark.skipif(not _endpoint_up(), reason="model endpoint offline")
 def test_model_driven_end_to_end(sample, expected_flag):
     ex = ReactExecutor(sample)

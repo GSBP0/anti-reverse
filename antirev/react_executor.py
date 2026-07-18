@@ -66,7 +66,8 @@ FINAL: <flag>
 
 {TOOL_SPEC}
 
-拿到确信的 flag(如 NSSCTF{{...}} / flag{{...}})后输出 FINAL。工具报错或结果不对就换方法/改参数重试,不要放弃。"""
+拿到 flag 后输出 FINAL。**硬性要求:flag 必须是某个工具(通常 run_python)真实 print/输出出来的,不是你猜或编的——凭空编造的 flag 会被系统拒绝**。
+密码/编码题尽量正向重算自验(如 re-encrypt(候选,key)==已知密文,或再 encode 一遍==已知串)后再 FINAL。工具报错或结果是乱码就换方法/换参数(endian/rounds/key)/换算法重试,别放弃、别硬凑。"""
 
 _FUNC_RE = re.compile(r"<function=(\w+)>\s*(\{.*?\})\s*</function>", re.S)
 _FINAL_RE = re.compile(r"FINAL:\s*(\S.*)")
@@ -254,6 +255,17 @@ class ReactExecutor:
                 self._log("executor_output", step=step, text=text[:800], ctx_msgs=len(messages))
                 kind, payload = parse_step(text)
                 if kind == "final":
+                    # 反假阳性:flag 必须在某工具输出里真实出现过(否则疑似编造)
+                    inner = (payload[payload.find("{") + 1:payload.rfind("}")]
+                             if "{" in payload and "}" in payload else payload)
+                    grounded = (store.contains(self.run_id, payload)
+                                or (len(inner) >= 4 and store.contains(self.run_id, inner)))
+                    if not grounded:
+                        self._log("final_rejected", step=step, flag=payload, reason="未在工具输出中出现,疑似编造")
+                        ctx.push_exchange(text,
+                            "拒绝该 FINAL:你给的 flag 没有在任何工具输出里出现过——不要凭感觉编造!"
+                            "必须用 run_python 真正算出并 print 出 flag(建议正向重算比对密文自验),确认后再 FINAL。")
+                        continue
                     self._log("flag_found", step=step, flag=payload)
                     return {"flag": payload, "steps": step, "state": self.state,
                             "trace": ctx.step_notes[-15:]}

@@ -67,5 +67,15 @@ class MemoryStore:
         return [{"key": k, "value": v, "step": s} for (k, v, s) in self.conn.execute(
             "SELECT key,value,step FROM facts WHERE run_id=? ORDER BY id", (run_id,)).fetchall()]
 
+    def contains(self, run_id, needle) -> bool:
+        """needle 是否在本 run 任一工具输出全文里出现过(反假阳性:flag 必须有工具佐证)。"""
+        if not needle:
+            return False
+        for (t,) in self.conn.execute(
+                "SELECT full_text FROM artifacts WHERE run_id=?", (run_id,)):
+            if needle in (t or ""):
+                return True
+        return False
+
     def close(self) -> None:
         self.conn.close()

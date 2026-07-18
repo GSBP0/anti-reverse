@@ -65,12 +65,22 @@ def ground_truth(problem_dir: Path) -> set:
     return strong or flags
 
 
+def _is_exe(f: Path) -> bool:
+    try:
+        h = f.read_bytes()[:4]
+        return h[:2] == b"MZ" or h[:4] == b"\x7fELF"
+    except Exception:
+        return False
+
+
 def pick_binary(problem_dir: Path):
     annex = problem_dir / "annex"
     files = [f for f in annex.rglob("*") if f.is_file()]
     if not files:
         return None
-    # 选最大的可执行/二进制文件(排除说明类)
+    exes = [f for f in files if _is_exe(f)]     # 优先真正的 PE/ELF 可执行(修A_game选错文件)
+    if exes:
+        return max(exes, key=lambda f: f.stat().st_size)
     files = [f for f in files if f.suffix.lower() not in (".md", ".txt", ".png", ".jpg")] or files
     return max(files, key=lambda f: f.stat().st_size)
 
