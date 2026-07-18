@@ -99,3 +99,27 @@ def binwalk_scan(binary) -> dict:
         return {"ok": False, "error": "binwalk 未安装"}
     r = run_isolated(["binwalk", str(binary)], timeout=60)
     return {"ok": r.returncode == 0, "output": r.stdout[-3000:]}
+
+
+def ascii_strings(binary, min_len=5, limit=120) -> list:
+    """纯 Python 抽可打印 ASCII 串(供 Planner 预分析,不必起 IDA)。"""
+    data = Path(binary).read_bytes()
+    out, cur = [], bytearray()
+    for byte in data:
+        if 32 <= byte < 127:
+            cur.append(byte)
+        else:
+            if len(cur) >= min_len:
+                out.append(cur.decode("ascii"))
+            cur = bytearray()
+    if len(cur) >= min_len:
+        out.append(cur.decode("ascii"))
+    # 去重保序 + 截断
+    seen, uniq = set(), []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+        if len(uniq) >= limit:
+            break
+    return uniq
