@@ -28,10 +28,17 @@ from antirev.tools.ida_tools import IdaSession
 from antirev.tools.solve_locate import locate_targets
 from antirev.tools.solve_angr import solve_angr as _run_angr
 from antirev.tools.solve_verify import verify_candidate
+from antirev.tools.solve_unicorn import unicorn_emulate as _unicorn
 from antirev.tools.terminal import terminal as _run_terminal
 from antirev.tools.run_code import run_python as _run_python
+from antirev.tools import analyze_tools as _analyze
 
 TOOL_SPEC = """可用工具(每步只调一个):
+- analyze         args:{}                                看格式/架构/位数/导入数/是否加壳。**开局先调它**
+- unpack_upx      args:{}                                UPX 脱壳(analyze 报 UPX 时用),之后自动在脱壳文件上分析
+- floss           args:{}                                提取(含运行时解密的)混淆字符串,静态看不到明文时用
+- unicorn_emulate args:{"start":"0x..","stop":"0x..","regs":{"rdi":..},"mem_writes":[{"addr":..,"data_hex":".."}],"read_mem":{"addr":..,"size":..}}
+                                                         CPU 级模拟一段代码(自定义解密循环/VM handler),密码库覆盖不到时用
 - ida_list_functions args:{"filter":"可选子串"}          列出函数(名+地址)。找不到某函数名时用它定位!
 - ida_decompile   args:{"name_or_addr":"main|0x.."}      反编译一个函数。返回 pseudocode + data_refs(引用的数据真实地址)
                                                          + callees(调用的函数名+地址)。顺 callees 逐层深入(如 main→check_flag)
@@ -43,7 +50,7 @@ TOOL_SPEC = """可用工具(每步只调一个):
 - terminal        args:{"command":"..."}                 杂项命令(注:python 是系统解释器,无 ida 模块)
 - recall          args:{"artifact_id":N}                 重看某步观察的全文(早前步骤只留摘要,需要时按 artifact#N 取回)"""
 
-SYSTEM_PROMPT = f"""你是逆向 Executor,目标是解出 flag。按题选两条通用路线之一:
+SYSTEM_PROMPT = f"""你是逆向 Executor,目标是解出 flag。开局先 analyze 看清格式/架构/是否加壳;若加壳(如 UPX)先 unpack_upx。然后按题选两条通用路线之一:
 (A) 读懂算法→写逆运算:先 ida_decompile 读 main/校验逻辑,顺 callees 逐层看清算法。若是标准可逆算法
     (异或/base64/移位/TEA/XTEA/XXTEA/RC4/AES…),用 ida_read_bytes 取密文/密钥/轮数,再 run_python
     调**内置密码库**(别手写密码,易错):
@@ -127,6 +134,7 @@ class ReactExecutor:
         self.window = window
         self.run_id = getattr(logger, "run_id", None) or "exec"
         self.db_path = db_path or ":memory:"
+        self.active_binary = binary   # 脱壳后会切到 .unpacked
         self.state = {"find": None, "avoid": None, "candidate": None, "func_hint": None}
 
     def _log(self, type, **f):
@@ -134,41 +142,56 @@ class ReactExecutor:
             self.logger.event(type, **f)
 
     def _dispatch(self, tool, args, store):
+        b = self.active_binary
         try:
             if tool == "recall":
                 art = store.get_artifact(int(args.get("artifact_id")))
                 return {"full": art["full_text"][:6000]} if art else {"error": "无此 artifact"}
-            # 只读 IDA 工具:命中缓存直接返回,避免重复分析(§6.3)
-            if tool in ("ida_list_functions", "ida_decompile", "ida_read_bytes"):
+            # 只读 IDA 工具:命中缓存直接返回(仅未脱壳时,避免用错二进制的缓存)(§6.3)
+            if b == self.binary and tool in ("ida_list_functions", "ida_decompile", "ida_read_bytes"):
                 cached = store.find_cached(self.run_id, tool, args)
                 if cached:
                     return json.loads(cached["full_text"])
+            if tool == "analyze":
+                return {"file_info": _analyze.file_info(b), "packer": _analyze.detect_packer(b)}
+            if tool == "unpack_upx":
+                r = _analyze.unpack_upx(b)
+                if r.get("ok"):
+                    self.active_binary = r["out"]      # 后续分析切到脱壳产物
+                    r["note"] = "已切换到脱壳后文件,后续工具在其上分析"
+                return r
+            if tool == "floss":
+                return _analyze.floss_strings(b)
+            if tool == "unicorn_emulate":
+                return _unicorn(b, int(args["start"], 0) if isinstance(args["start"], str) else args["start"],
+                                int(args["stop"], 0) if isinstance(args["stop"], str) else args["stop"],
+                                arch=args.get("arch", "x86_64"), regs=args.get("regs"),
+                                mem_writes=args.get("mem_writes"), read_mem=args.get("read_mem"))
             if tool == "ida_list_functions":
-                with IdaSession(self.binary) as ida:
+                with IdaSession(b) as ida:
                     fns = ida.list_functions(args.get("filter"))
                     return {"count": len(fns),
                             "functions": [{"addr": hex(f["addr"]), "name": f["name"],
                                            "size": f["size"]} for f in fns[:500]]}
             if tool == "ida_decompile":
-                with IdaSession(self.binary) as ida:
+                with IdaSession(b) as ida:
                     r = ida.decompile(args["name_or_addr"])
                     return {"pseudocode": r["pseudocode"][:5000],
-                            "data_refs": r.get("data_refs", []),
-                            "callees": r.get("callees", [])}
+                            "data_refs": r.get("data_refs", []), "callees": r.get("callees", [])}
             if tool == "ida_read_bytes":
-                with IdaSession(self.binary) as ida:
+                with IdaSession(b) as ida:
                     return ida.get_bytes(args["name_or_addr"], int(args["size"]))
             if tool == "run_python":
-                return _run_python(args["code"], binary=self.binary)
+                return _run_python(args["code"], binary=b)
             if tool == "solve_locate":
-                r = locate_targets(self.binary)
+                r = locate_targets(b)
                 self.state.update(find=r["find"], avoid=r["avoid"], func_hint=r.get("func_hint"))
                 return {"find": r["find"], "avoid": r["avoid"]}
             if tool == "solve_angr":
                 find = args.get("find") or self.state["find"]
                 if not find:
                     return {"error": "请先 solve_locate 得到 find/avoid"}
-                r = _run_angr(self.binary, find=find, avoid=args.get("avoid") or self.state["avoid"] or [],
+                r = _run_angr(b, find=find, avoid=args.get("avoid") or self.state["avoid"] or [],
                               stdin_len=int(args.get("stdin_len", 32)), start_addr=self.state.get("func_hint"))
                 if r.get("found"):
                     self.state["candidate"] = r["stdin"].split("\x00")[0].strip()
@@ -178,7 +201,7 @@ class ReactExecutor:
                 if not cand:
                     return {"error": "无候选,请先 solve_angr"}
                 find, avoid = self.state["find"], self.state["avoid"]
-                r = verify_candidate(self.binary, cand, find=(find[0] if find else None),
+                r = verify_candidate(b, cand, find=(find[0] if find else None),
                                      avoid=(avoid[0] if avoid else None))
                 r["candidate"] = cand
                 return r
