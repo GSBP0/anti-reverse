@@ -72,6 +72,10 @@ FINAL: <flag>
 _FUNC_RE = re.compile(r"<function=(\w+)>\s*(\{.*?\})\s*</function>", re.S)
 _FINAL_RE = re.compile(r"FINAL:\s*(\S.*)")
 
+# 解题尝试类工具(其新结果算"进展", 用于 stuck 检测);纯探索(反编译/读字节/列函数)不算进展
+_SOLVE_TOOLS = {"run_python", "solve_locate", "solve_angr", "solve_verify",
+                "unpack_upx", "floss", "unicorn_emulate"}
+
 
 def _extract_json(s: str):
     start = s.find("{")
@@ -290,11 +294,14 @@ class ReactExecutor:
                     obs = self._dispatch(tool, args, store)
                     self._log("tool_result", step=step, tool=tool, args=args, obs=obs)
                     obs_txt = ctx.record(step, tool, args, obs)
-                    # 新进展检测:非错误且首次见到的(工具+摘要签名)→ 刷新进展时刻
-                    sig = f"{tool}:{ctx._brief(tool, obs)}"
-                    if not (isinstance(obs, dict) and obs.get("error")) and sig not in self._progress["seen"]:
-                        self._progress["seen"].add(sig)
-                        self._progress["last"] = time.time()  # 压缩+存全量,返回上下文视图
+                    # 新进展检测(§11):进展=**解题尝试**产出了**新的**非错误结果(run_python/solve_*/脱壳等)。
+                    # 纯探索(反编译/读字节)与重复的失败尝试都不算 —— 免得大二进制靠不断反编译新函数、
+                    # 或反复同一失败脚本骗过 stuck。10min 没有"新解题进展"即判卡在错误方向。
+                    if tool in _SOLVE_TOOLS and not (isinstance(obs, dict) and obs.get("error")):
+                        sig = f"{tool}:{ctx._brief(tool, obs)}"
+                        if sig not in self._progress["seen"]:
+                            self._progress["seen"].add(sig)
+                            self._progress["last"] = time.time()  # 压缩+存全量,返回上下文视图
                     if repeat >= 2 or tool_run >= 4:  # 无进展检测(§3.4/§11)
                         self._log("no_progress", step=step, tool=tool)
                         obs_txt += ("\n\n[系统提示] 你在无进展地重复。停!换完全不同的思路:"
