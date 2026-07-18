@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "antirev"
+version = "0.0.1"
+description = "Offline CTF reverse-engineering agent framework"
+requires-python = ">=3.12"
+
+[tool.setuptools.packages.find]
+include = ["antirev*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
