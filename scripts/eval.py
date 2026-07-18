@@ -182,6 +182,7 @@ def main():
             rec = {"pid": pid, "title": pdir.name, "binary": binary.name, "format": fmt,
                    "status": "out_of_scope", "solved": False, "has_truth": bool(truth)}
         else:
+            (config.LOG_DIR / f"{run_id}.jsonl").unlink(missing_ok=True)  # 清旧日志,免污染分析
             r = run_one(binary, run_id, args.budget, args.stuck)
             ok = score(r.get("flag"), truth)
             rec = {"pid": pid, "title": pdir.name, "binary": binary.name,
