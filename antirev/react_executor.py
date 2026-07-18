@@ -22,6 +22,8 @@ import re
 import requests
 
 from antirev import config
+from antirev.memory.store import MemoryStore
+from antirev.memory.context import ContextManager
 from antirev.tools.ida_tools import IdaSession
 from antirev.tools.solve_locate import locate_targets
 from antirev.tools.solve_angr import solve_angr as _run_angr
@@ -38,7 +40,8 @@ TOOL_SPEC = """可用工具(每步只调一个):
 - solve_locate    args:{}                                确定性定位成功/失败分支地址
 - solve_angr      args:{"stdin_len":N}                    符号执行求输入(自动用已定位 find/avoid)
 - solve_verify    args:{}                                把上一步 angr 候选喂回二进制自验
-- terminal        args:{"command":"..."}                 杂项命令(注:python 是系统解释器,无 ida 模块)"""
+- terminal        args:{"command":"..."}                 杂项命令(注:python 是系统解释器,无 ida 模块)
+- recall          args:{"artifact_id":N}                 重看某步观察的全文(早前步骤只留摘要,需要时按 artifact#N 取回)"""
 
 SYSTEM_PROMPT = f"""你是逆向 Executor,目标是解出 flag。按题选两条通用路线之一:
 (A) 读懂算法→写逆运算:先 ida_decompile 读 main/校验逻辑。若是可逆算法(异或/base64/移位/TEA/XTEA/RC4…),
@@ -113,19 +116,30 @@ class ChatClient:
 
 
 class ReactExecutor:
-    def __init__(self, binary, client=None, logger=None, max_steps=60):
+    def __init__(self, binary, client=None, logger=None, max_steps=60, window=6, db_path=None):
         self.binary = binary
         self.client = client or ChatClient()
         self.logger = logger
         self.max_steps = max_steps
+        self.window = window
+        self.run_id = getattr(logger, "run_id", None) or "exec"
+        self.db_path = db_path or ":memory:"
         self.state = {"find": None, "avoid": None, "candidate": None, "func_hint": None}
 
     def _log(self, type, **f):
         if self.logger:
             self.logger.event(type, **f)
 
-    def _dispatch(self, tool, args):
+    def _dispatch(self, tool, args, store):
         try:
+            if tool == "recall":
+                art = store.get_artifact(int(args.get("artifact_id")))
+                return {"full": art["full_text"][:6000]} if art else {"error": "无此 artifact"}
+            # 只读 IDA 工具:命中缓存直接返回,避免重复分析(§6.3)
+            if tool in ("ida_list_functions", "ida_decompile", "ida_read_bytes"):
+                cached = store.find_cached(self.run_id, tool, args)
+                if cached:
+                    return json.loads(cached["full_text"])
             if tool == "ida_list_functions":
                 with IdaSession(self.binary) as ida:
                     fns = ida.list_functions(args.get("filter"))
@@ -172,39 +186,39 @@ class ReactExecutor:
             return {"error": repr(e)}
 
     def run(self, plan: str):
-        messages = [{"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": plan}]
-        last_sig, repeat = None, 0
-        last_tool, tool_run = None, 0
-        for step in range(1, self.max_steps + 1):
-            text = self.client.complete(messages)
-            self._log("executor_output", step=step, text=text[:800])
-            kind, payload = parse_step(text)
-            if kind == "final":
-                self._log("flag_found", step=step, flag=payload)
-                return {"flag": payload, "steps": step, "state": self.state}
-            if kind == "action":
-                tool, args = payload["tool"], payload["args"]
-                sig = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-                repeat = repeat + 1 if sig == last_sig else 0
-                last_sig = sig
-                tool_run = tool_run + 1 if tool == last_tool else 0
-                last_tool = tool
-                obs = self._dispatch(tool, args)
-                self._log("tool_result", step=step, tool=tool, args=args, obs=obs)
-                messages.append({"role": "assistant", "content": text})
-                obs_txt = f"OBSERVATION: {json.dumps(obs, ensure_ascii=False)[:6000]}"
-                # 无进展检测(§3.4/§11):同一动作重复,或同一工具连刷多次(如瞎猜地址) → 强打断
-                if repeat >= 2 or tool_run >= 4:
-                    self._log("no_progress", step=step, tool=tool)
-                    obs_txt += ("\n\n[系统提示] 你在无进展地重复。停!换完全不同的思路:"
-                                "找不到函数就用 ida_list_functions 列全部函数按名定位;"
-                                "读数据按 data_refs 的真实地址(别用伪代码显示名);"
-                                "读懂算法后用 run_python 写逆运算脚本;或试 solve_angr。别再瞎猜地址。")
-                    repeat, tool_run = 0, 0
-                messages.append({"role": "user", "content": obs_txt})
-            else:
-                messages.append({"role": "assistant", "content": text})
-                messages.append({"role": "user",
-                                 "content": "格式错误。请只输出一行 ACTION: {json} 或 FINAL: <flag>。"})
-        return {"flag": None, "steps": self.max_steps, "error": "达到步数上限", "state": self.state}
+        store = MemoryStore(self.db_path)
+        ctx = ContextManager(store, self.run_id, window=self.window)
+        ctx.set_goal(plan[:200])
+        last_sig, repeat, last_tool, tool_run = None, 0, None, 0
+        try:
+            for step in range(1, self.max_steps + 1):
+                messages = ctx.build_messages(SYSTEM_PROMPT, plan)  # 有界:system+WM+最近window步
+                text = self.client.complete(messages)
+                self._log("executor_output", step=step, text=text[:800], ctx_msgs=len(messages))
+                kind, payload = parse_step(text)
+                if kind == "final":
+                    self._log("flag_found", step=step, flag=payload)
+                    return {"flag": payload, "steps": step, "state": self.state}
+                if kind == "action":
+                    tool, args = payload["tool"], payload["args"]
+                    sig = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+                    repeat = repeat + 1 if sig == last_sig else 0
+                    last_sig = sig
+                    tool_run = tool_run + 1 if tool == last_tool else 0
+                    last_tool = tool
+                    obs = self._dispatch(tool, args, store)
+                    self._log("tool_result", step=step, tool=tool, args=args, obs=obs)
+                    obs_txt = ctx.record(step, tool, args, obs)  # 压缩+存全量,返回上下文视图
+                    if repeat >= 2 or tool_run >= 4:  # 无进展检测(§3.4/§11)
+                        self._log("no_progress", step=step, tool=tool)
+                        obs_txt += ("\n\n[系统提示] 你在无进展地重复。停!换完全不同的思路:"
+                                    "找不到函数就 ida_list_functions 列全部按名定位;"
+                                    "读数据按 data_refs 真实地址(别用显示名);"
+                                    "读懂算法后 run_python 写逆运算;或试 solve_angr。别再瞎猜地址。")
+                        repeat, tool_run = 0, 0
+                    ctx.push_exchange(text, obs_txt)
+                else:
+                    ctx.push_exchange(text, "格式错误。请只输出一行 ACTION: {json} 或 FINAL: <flag>。")
+            return {"flag": None, "steps": self.max_steps, "error": "达到步数上限", "state": self.state}
+        finally:
+            store.close()
