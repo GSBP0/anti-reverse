@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # —— 模型端点(OpenAI 兼容) ——
 MODEL_BASE_URL = os.environ.get("ANTIREV_MODEL_URL", "http://127.0.0.1:7777/v1")
 MODEL_API_KEY = os.environ.get("ANTIREV_MODEL_KEY", "sk-local")
-MODEL_NAME = os.environ.get("ANTIREV_MODEL_NAME", "local")
+MODEL_NAME = os.environ.get("ANTIREV_MODEL_NAME", "qwen3.6-35b-a3b-6bit")
 
 # —— IDA ——
 IDA_APP = Path(os.environ.get(
