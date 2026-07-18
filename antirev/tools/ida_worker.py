@@ -33,6 +33,19 @@ def _resolve_ea(idc, ida_funcs, ida_idaapi, name_or_addr):
     return f.start_ea if f else ea
 
 
+def _resolve_data_ea(idc, ida_idaapi, name_or_addr):
+    """解析数据地址(名或十六进制),不做函数归属解析。"""
+    if isinstance(name_or_addr, int):
+        return name_or_addr
+    s = str(name_or_addr).strip()
+    if s.lower().startswith("0x"):
+        return int(s, 16)
+    ea = idc.get_name_ea_simple(s)
+    if ea == ida_idaapi.BADADDR:
+        raise ValueError(f"cannot resolve data {name_or_addr!r}")
+    return ea
+
+
 def _ensure_func(ida_funcs, ida_auto, ea):
     """确保 ea 处存在函数。极简/无终止符的二进制,IDA 自动分析可能不建函数;显式补建。"""
     if ida_funcs.get_func(ea) is None:
@@ -57,12 +70,28 @@ def _handle(cmd, a, mods):
         fns = list(idautils.Functions())
         return {"addr": int(fns[0]) if fns else 0}
     if cmd == "decompile":
+        import ida_bytes
         ea = _resolve_ea(idc, ida_funcs, ida_idaapi, a["name_or_addr"])
         _ensure_func(ida_funcs, ida_auto, ea)
         cf = ida_hexrays.decompile(ea)
         if cf is None:
             raise RuntimeError("hexrays returned None")
-        return {"addr": int(ea), "name": idc.get_func_name(ea), "pseudocode": str(cf)}
+        # 附带函数内引用的数据地址(全局常量/密文/串) —— 伪代码里的 enc_0 显示名未必可解析,
+        # 给出真实地址+预览,模型才能按地址 read_bytes(这是"读算法→取常量"流程的关键)
+        f = ida_funcs.get_func(ea)
+        drefs, seen = [], set()
+        if f:
+            for item in idautils.FuncItems(f.start_ea):
+                for d in idautils.DataRefsFrom(item):
+                    if d in seen:
+                        continue
+                    seen.add(d)
+                    b = ida_bytes.get_bytes(d, 16) or b""
+                    drefs.append({"addr": hex(int(d)), "name": idc.get_name(d) or "",
+                                  "preview_hex": b.hex(),
+                                  "preview_ascii": "".join(chr(c) if 32 <= c < 127 else "." for c in b)})
+        return {"addr": int(ea), "name": idc.get_func_name(ea),
+                "pseudocode": str(cf), "data_refs": drefs}
     if cmd == "strings":
         import re
         rx = re.compile(a["filter"], re.I) if a.get("filter") else None
@@ -77,6 +106,16 @@ def _handle(cmd, a, mods):
         ea = int(a["addr"])
         return [{"frm": int(x.frm), "func": idc.get_func_name(x.frm)}
                 for x in idautils.XrefsTo(ea)]
+    if cmd == "func_start":
+        f = ida_funcs.get_func(int(a["addr"]))
+        return {"addr": int(f.start_ea) if f else int(a["addr"]),
+                "name": idc.get_func_name(int(a["addr"]))}
+    if cmd == "get_bytes":
+        import ida_bytes
+        ea = _resolve_data_ea(idc, ida_idaapi, a["name_or_addr"])
+        size = int(a["size"])
+        data = ida_bytes.get_bytes(ea, size) or b""
+        return {"addr": int(ea), "size": len(data), "hex": data.hex()}
     raise ValueError(f"unknown cmd {cmd}")
 
 

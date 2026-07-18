@@ -86,11 +86,10 @@ def build_code():
     code_len = len(code)
     # 数据紧跟代码;计算各数据虚拟地址
     data_off = CODE_OFF + code_len
-    dv = {
-        "target": V + data_off,
-        "msg_ok": V + data_off + len(TARGET),
-        "msg_no": V + data_off + len(TARGET) + 8,   # "Correct\n"=8
-    }
+    # 每段之间都用 null 分隔,否则 IDA 会把相邻数据(异或后的 target 恰好可打印)连成一个串
+    ok_off = data_off + len(TARGET) + 1              # null 分隔 target/msg_ok
+    no_off = ok_off + len(b"Correct\n") + 1          # null 分隔 msg_ok/msg_no
+    dv = {"target": V + data_off, "msg_ok": V + ok_off, "msg_no": V + no_off}
     # 回填短跳转 rel8
     for pos, tgt in jmp_fixups:
         rel = labels[tgt] - (pos + 1)
@@ -106,7 +105,7 @@ def build_code():
 
 def build_elf():
     code, _ = build_code()
-    data = TARGET + b"Correct\n" + b"Wrong\n"
+    data = TARGET + b"\x00" + b"Correct\n\x00" + b"Wrong\n\x00"   # 各段 null 分隔
     image = code + data
     total = CODE_OFF + len(image)
     entry = V + CODE_OFF

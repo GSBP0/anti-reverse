@@ -31,7 +31,8 @@ def run_pipeline(binary: str, stdin_len: int = 32, logger=None) -> dict:
                 "error": "no find target located"}
 
     sol = solve_angr(binary, find=tgt["find"], avoid=tgt["avoid"],
-                     input_kind="stdin", stdin_len=stdin_len)
+                     input_kind="stdin", stdin_len=stdin_len,
+                     start_addr=tgt.get("func_hint"))
     _log(step="solve.angr", found=sol.get("found"), error=sol.get("error"))
     if not sol.get("found"):
         return {"flag": None, "verified": False, "steps": steps,

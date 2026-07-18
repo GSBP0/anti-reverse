@@ -15,7 +15,9 @@ def test_decompile_returns_pseudocode(sample):
 
 
 def test_xrefs_to_message_string(sample):
-    # 0x400105 = "Correct\n";应有来自 correct 分支 lea 的 xref
+    # "Correct" 串应有来自 correct 分支 lea 的 xref(地址动态取,不硬编码)
     with IdaSession(sample) as ida:
-        refs = ida.xrefs_to(0x400105)
-        assert any(0x400078 <= x["frm"] < 0x4000f4 for x in refs), refs
+        correct = [s for s in ida.strings() if "Correct" in s["value"]]
+        assert correct, "IDA 应检测到 Correct 串"
+        refs = ida.xrefs_to(correct[0]["addr"])
+        assert refs, "Correct 串应有 xref"

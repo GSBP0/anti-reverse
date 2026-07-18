@@ -110,3 +110,11 @@ class IdaSession:
 
     def xrefs_to(self, addr):
         return self._rpc("xrefs_to", addr=int(addr))
+
+    def func_start(self, addr):
+        """返回含 addr 的函数起始地址(供 angr blank_state 跳过 CRT 从 main 起)。"""
+        return self._rpc("func_start", addr=int(addr))["addr"]
+
+    def get_bytes(self, name_or_addr, size):
+        """读取指定数据(名或地址)的原始字节,返回 {addr,size,hex}。用于取加密常量/密文等。"""
+        return self._rpc("get_bytes", name_or_addr=name_or_addr, size=int(size))

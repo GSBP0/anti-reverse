@@ -29,11 +29,12 @@ PER_CHALLENGE_BUDGET = int(os.environ.get("ANTIREV_CHALL_BUDGET", "1200"))  # 20
 LOG_DIR = Path(os.environ.get("ANTIREV_LOG_DIR", str(PROJECT_ROOT / "logs")))
 
 # —— 求解成功/失败关键词(§5.2 solve.locate_targets 用) ——
+# 注:刻意剔除过泛的词(flag/error/bad),它们会误匹配 "input flag:"、CRT "Unknown error" 等。
 SUCCESS_KEYWORDS = [
-    "correct", "success", "right", "congrat", "well done", "nice",
-    "good job", "flag", "accepted", "you win", "solved", "great",
+    "correct", "congrat", "right", "well done", "good job", "you win",
+    "you got", "accepted", "success", "solved", "great job", "nice job",
 ]
 FAIL_KEYWORDS = [
-    "wrong", "incorrect", "nope", "try again", "denied", "invalid",
-    "fail", "error", "bad", "no.", "sorry",
+    "wrong", "incorrect", "invalid", "denied", "try again", "nope",
+    "failed", "not right", "not correct",
 ]
