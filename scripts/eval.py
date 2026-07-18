@@ -14,9 +14,28 @@ import time
 from pathlib import Path
 
 from antirev import config
-from antirev.tools.analyze_tools import file_info
+from antirev.tools.analyze_tools import file_info, ascii_strings
 
 ROOT = config.PROJECT_ROOT
+_SOLVABLE_KW = ("correct", "wrong", "right", "flag", "nssctf", "tea", "xtea", "rc4",
+                "aes", "base64", "xor", "key", "input", "encrypt", "cipher")
+
+
+def triage_score(binary) -> int:
+    """§11 先打软柿子:估可解性(高分先跑)。有密码/成功失败线索、体积小、导入少 → 更可能可解。"""
+    try:
+        fi = file_info(binary)
+        if fi["format"] not in ("PE", "ELF"):
+            return -1
+        blob = " ".join(ascii_strings(binary, 5, 400)).lower()
+        s = sum(2 for kw in _SOLVABLE_KW if kw in blob)
+        if fi.get("size", 10 ** 9) < 80_000:
+            s += 3
+        if fi.get("num_imports", 99) < 20:
+            s += 1
+        return s
+    except Exception:
+        return -1
 FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,12}\{[^}]{1,120}\}")
 # 明显不是 flag 的花括号内容(代码/占位),排除
 _NOISE = ("void", "int ", "char ", "return", "if(", "for(", "printf", "struct", "0x")
@@ -111,6 +130,11 @@ def main():
     only = set(args.only.split(",")) if args.only else None
     if only:
         problems = [p for p in problems if p.name.split("_")[0] in only]
+    # §11 triage:按可解性排序,先打软柿子(可解题早出结果)
+    def _score(pd):
+        b = pick_binary(pd)
+        return triage_score(b) if b else -1
+    problems.sort(key=_score, reverse=True)
     if args.limit:
         problems = problems[:args.limit]
 
