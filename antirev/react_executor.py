@@ -44,8 +44,11 @@ TOOL_SPEC = """可用工具(每步只调一个):
 - recall          args:{"artifact_id":N}                 重看某步观察的全文(早前步骤只留摘要,需要时按 artifact#N 取回)"""
 
 SYSTEM_PROMPT = f"""你是逆向 Executor,目标是解出 flag。按题选两条通用路线之一:
-(A) 读懂算法→写逆运算:先 ida_decompile 读 main/校验逻辑。若是可逆算法(异或/base64/移位/TEA/XTEA/RC4…),
-    用 ida_read_bytes 取出密文/密钥常量,再 run_python 写逆运算脚本算 flag —— 脚本里最好正向重算一遍自验,并 print(flag)。
+(A) 读懂算法→写逆运算:先 ida_decompile 读 main/校验逻辑,顺 callees 逐层看清算法。若是标准可逆算法
+    (异或/base64/移位/TEA/XTEA/XXTEA/RC4/AES…),用 ida_read_bytes 取密文/密钥/轮数,再 run_python
+    调**内置密码库**(别手写密码,易错):
+    `from antirev.crypto import tea_decrypt_bytes, xtea_decrypt_bytes, xxtea_decrypt_bytes, rc4, aes_ecb_decrypt, aes_cbc_decrypt, b64_custom_decode, xor_bytes`
+    (TEA 系列有 endian/rounds 参数:解出乱码先换 little/big,轮数从伪代码读)。脚本里正向重算自验,print(flag)。
 (B) 符号执行:若是"读输入→逐步比较→到达成功分支"型,solve_locate → solve_angr(stdin_len=?) → solve_verify。
 
 每步只输出下面之一(可先写一行 THOUGHT: 简述):
