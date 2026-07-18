@@ -72,9 +72,25 @@ FINAL: <flag>
 _FUNC_RE = re.compile(r"<function=(\w+)>\s*(\{.*?\})\s*</function>", re.S)
 _FINAL_RE = re.compile(r"FINAL:\s*(\S.*)")
 
-# 解题尝试类工具(其新结果算"进展", 用于 stuck 检测);纯探索(反编译/读字节/列函数)不算进展
-_SOLVE_TOOLS = {"run_python", "solve_locate", "solve_angr", "solve_verify",
-                "unpack_upx", "floss", "unicorn_emulate"}
+_FLAGISH_RE = re.compile(r"[A-Za-z0-9_]{2,}\{[^}]{2,}\}")
+
+
+def _is_progress(tool, obs) -> bool:
+    """是否算"朝解题前进"的真进展(重置 stuck 计时)。纯探索(反编译/读字节)、乱码/失败尝试都**不**算 ——
+    这样"迷路空转"或"反复失败尝试"超 10min 会被判卡在错误方向(§11)。"""
+    if not isinstance(obs, dict) or obs.get("error"):
+        return False
+    if tool == "run_python":
+        return bool(_FLAGISH_RE.search(obs.get("stdout") or ""))   # 产出了 flag 样候选才算
+    if tool == "solve_angr":
+        return bool(obs.get("found"))
+    if tool == "solve_verify":
+        return bool(obs.get("accepted"))
+    if tool == "solve_locate":
+        return bool(obs.get("find"))
+    if tool == "unpack_upx":
+        return bool(obs.get("ok"))
+    return False
 
 
 def _extract_json(s: str):
@@ -294,10 +310,10 @@ class ReactExecutor:
                     obs = self._dispatch(tool, args, store)
                     self._log("tool_result", step=step, tool=tool, args=args, obs=obs)
                     obs_txt = ctx.record(step, tool, args, obs)
-                    # 新进展检测(§11):进展=**解题尝试**产出了**新的**非错误结果(run_python/solve_*/脱壳等)。
-                    # 纯探索(反编译/读字节)与重复的失败尝试都不算 —— 免得大二进制靠不断反编译新函数、
-                    # 或反复同一失败脚本骗过 stuck。10min 没有"新解题进展"即判卡在错误方向。
-                    if tool in _SOLVE_TOOLS and not (isinstance(obs, dict) and obs.get("error")):
+                    # 新进展检测(§11):只有"朝解题前进"的**新**进展才重置 stuck(见 _is_progress):
+                    # 产出 flag 样候选 / angr found / verify accepted / locate 到 / 脱壳成功。
+                    # 纯探索与乱码失败尝试都不算 → 10min 无真进展即判卡错误方向,提前失败。
+                    if _is_progress(tool, obs):
                         sig = f"{tool}:{ctx._brief(tool, obs)}"
                         if sig not in self._progress["seen"]:
                             self._progress["seen"].add(sig)
