@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from antirev import config
+from antirev.tools.analyze_tools import file_info
 
 ROOT = config.PROJECT_ROOT
 FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,12}\{[^}]{1,120}\}")
@@ -123,9 +124,14 @@ def main():
         binary = pick_binary(pdir)
         truth = ground_truth(pdir)
         run_id = f"eval_{pid}"
+        fmt = file_info(binary)["format"] if binary else None
         if not binary:
             rec = {"pid": pid, "title": pdir.name, "status": "no_binary",
                    "solved": False, "has_truth": bool(truth)}
+        elif fmt not in ("PE", "ELF"):
+            # §11 跨题triage:非 PE/ELF(pyc/txt/apk/Unity等)超本框架范围,快速跳过不浪费预算
+            rec = {"pid": pid, "title": pdir.name, "binary": binary.name, "format": fmt,
+                   "status": "out_of_scope", "solved": False, "has_truth": bool(truth)}
         else:
             r = run_one(binary, run_id, args.budget)
             ok = score(r.get("flag"), truth)
