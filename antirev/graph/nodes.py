@@ -50,12 +50,13 @@ def make_planner(client, logger=None):
     return planner_node
 
 
-def make_executor(client, logger=None, max_steps=60):
+def make_executor(client, logger=None, max_steps=60, time_budget=None):
     def executor_node(state):
         binary = state["binary"]
         task = (f"题目文件: {binary}\n\n## 预分析\n{_fmt_pre(state.get('pre_analysis', {}))}\n\n"
                 f"## Plan\n{state.get('plan', '')}\n\n按 Plan 解出 flag,拿到后用 FINAL 输出。")
-        ex = ReactExecutor(binary, client=client, logger=logger, max_steps=max_steps)
+        ex = ReactExecutor(binary, client=client, logger=logger, max_steps=max_steps,
+                           time_budget=time_budget)
         result = ex.run(task)
         ev = list(state.get("evidence", []))
         ev.append({"replan": state.get("replan_count", 0), "steps": result.get("steps"),

@@ -18,6 +18,7 @@ Executor 解析 ACTION → 执行 → 追加 OBSERVATION,循环至 FINAL 或步�
 from __future__ import annotations
 import json
 import re
+import time
 
 import requests
 
@@ -126,12 +127,14 @@ class ChatClient:
 
 
 class ReactExecutor:
-    def __init__(self, binary, client=None, logger=None, max_steps=60, window=6, db_path=None):
+    def __init__(self, binary, client=None, logger=None, max_steps=60, window=6, db_path=None,
+                 time_budget=None):
         self.binary = binary
         self.client = client or ChatClient()
         self.logger = logger
         self.max_steps = max_steps
         self.window = window
+        self.time_budget = time_budget    # 秒;超预算优雅停止(§11),在子进程硬超时前保住日志
         self.run_id = getattr(logger, "run_id", None) or "exec"
         self.db_path = db_path or ":memory:"
         self.active_binary = binary   # 脱壳后会切到 .unpacked
@@ -216,8 +219,12 @@ class ReactExecutor:
         ctx = ContextManager(store, self.run_id, window=self.window)
         ctx.set_goal(plan[:200])
         last_sig, repeat, last_tool, tool_run = None, 0, None, 0
+        start = time.time()
         try:
             for step in range(1, self.max_steps + 1):
+                if self.time_budget and time.time() - start > self.time_budget:
+                    self._log("time_budget_exceeded", step=step)
+                    return {"flag": None, "steps": step, "error": "超时间预算", "state": self.state}
                 messages = ctx.build_messages(SYSTEM_PROMPT, plan)  # 有界:system+WM+最近window步
                 text = self.client.complete(messages)
                 self._log("executor_output", step=step, text=text[:800], ctx_msgs=len(messages))

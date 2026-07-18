@@ -12,10 +12,10 @@ from antirev.graph.state import AgentState
 from antirev.graph.nodes import make_planner, make_executor, make_router
 
 
-def build_graph(client, logger=None, max_replan=2, max_steps=60):
+def build_graph(client, logger=None, max_replan=2, max_steps=60, time_budget=None):
     g = StateGraph(AgentState)
     g.add_node("planner", make_planner(client, logger))
-    g.add_node("executor", make_executor(client, logger, max_steps))
+    g.add_node("executor", make_executor(client, logger, max_steps, time_budget))
     g.set_entry_point("planner")
     g.add_edge("planner", "executor")
     g.add_conditional_edges("executor", make_router(max_replan),
@@ -23,10 +23,10 @@ def build_graph(client, logger=None, max_replan=2, max_steps=60):
     return g.compile()
 
 
-def solve(binary, client=None, logger=None, max_replan=2, max_steps=60):
+def solve(binary, client=None, logger=None, max_replan=2, max_steps=60, time_budget=None):
     """双 Agent 端到端解一道题。返回 {flag, status, replans, plan}。"""
     client = client or ChatClient()
-    app = build_graph(client, logger, max_replan, max_steps)
+    app = build_graph(client, logger, max_replan, max_steps, time_budget)
     final = app.invoke({"binary": str(binary), "replan_count": 0, "evidence": []},
                        {"recursion_limit": 50})
     return {"flag": final.get("flag"), "status": final.get("status"),
