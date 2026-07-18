@@ -1,6 +1,9 @@
-"""MVP ReAct Executor(§3.3):系统 prompt + 手写 Plan 作初始输入,只用四工具解出 flag。
+"""基于 LangGraph create_react_agent 的 Executor(依赖**原生 OpenAI tool_calls**)。
 
-- 不开模型内置 thinking(§3.3):ReAct 的显式推理已够,叠 thinking 翻倍延迟且弱模型易跑飞。
+⚠️ 本机端点是 mlx_lm.server,不解析原生 tool_calls,故此路径在当前端点**不可用**;
+   实际生产走 antirev.react_executor(自研文本协议)。本模块留作**支持原生 tool_calls
+   的端点**(如带工具解析的 vLLM/TGI)备用,并作 LangChain 装配的冒烟参照。
+
 - 工具 = 薄封装,复用 Task 4–8 的厚工具函数。
 - 强成功判据:solve_verify 的 accepted=True 才算真 flag。
 """
