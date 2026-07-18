@@ -53,10 +53,11 @@ TOOL_SPEC = """可用工具(每步只调一个):
 
 SYSTEM_PROMPT = f"""你是逆向 Executor,目标是解出 flag。开局先 analyze 看清格式/架构/是否加壳;若加壳(如 UPX)先 unpack_upx。然后按题选两条通用路线之一:
 (A) 读懂算法→写逆运算:先 ida_decompile 读 main/校验逻辑,顺 callees 逐层看清算法。若是标准可逆算法
-    (异或/base64/移位/TEA/XTEA/XXTEA/RC4/AES…),用 ida_read_bytes 取密文/密钥/轮数,再 run_python
-    调**内置密码库**(别手写密码,易错):
-    `from antirev.crypto import tea_decrypt_bytes, xtea_decrypt_bytes, xxtea_decrypt_bytes, rc4, aes_ecb_decrypt, aes_cbc_decrypt, b64_custom_decode, xor_bytes`
-    (TEA 系列有 endian/rounds 参数:解出乱码先换 little/big,轮数从伪代码读)。脚本里正向重算自验,print(flag)。
+    (异或/base64/移位/TEA/XTEA/XXTEA/RC4/AES…),用 ida_read_bytes 取密文/密钥,再 run_python 调**内置密码库**(别手写):
+    - **优先** `from antirev.crypto import smart_decrypt; print(smart_decrypt('xtea', enc_hex, key_hex, hint='NSSCTF'))`
+      —— 自动遍历 endian×rounds×delta,取 flag_like=True 的候选(免猜参数,algo 填 tea/xtea/xxtea/rc4)。
+    - 其它:`tea_decrypt_bytes/xtea_decrypt_bytes/xxtea_decrypt_bytes/rc4/aes_ecb_decrypt/b64_custom_decode/xor_bytes`。
+    - 若 smart_decrypt 全不像 flag → 算法可能是**魔改**,需按伪代码**精确复现**自定义运算再逆。脚本里正向重算自验,print(flag)。
 (B) 符号执行:若是"读输入→逐步比较→到达成功分支"型,solve_locate → solve_angr(stdin_len=?) → solve_verify。
 
 每步只输出下面之一(可先写一行 THOUGHT: 简述):
@@ -138,7 +139,32 @@ class ReactExecutor:
         self.run_id = getattr(logger, "run_id", None) or "exec"
         self.db_path = db_path or ":memory:"
         self.active_binary = binary   # 脱壳后会切到 .unpacked
+        self._ida = None              # 常驻 IdaSession(一次分析多次查询,避免每步重开 worker)
         self.state = {"find": None, "avoid": None, "candidate": None, "func_hint": None}
+
+    def _get_ida(self):
+        """取常驻 IdaSession;进程死了或切了二进制(脱壳)则重开。"""
+        from pathlib import Path as _P
+        resolved = str(_P(self.active_binary).resolve())
+        if self._ida is not None and (self._ida.p is None or self._ida.p.poll() is not None
+                                      or self._ida.binary != resolved):
+            try:
+                self._ida.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._ida = None
+        if self._ida is None:
+            self._ida = IdaSession(self.active_binary)
+            self._ida.__enter__()
+        return self._ida
+
+    def _close_ida(self):
+        if self._ida is not None:
+            try:
+                self._ida.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._ida = None
 
     def _log(self, type, **f):
         if self.logger:
@@ -171,19 +197,16 @@ class ReactExecutor:
                                 arch=args.get("arch", "x86_64"), regs=args.get("regs"),
                                 mem_writes=args.get("mem_writes"), read_mem=args.get("read_mem"))
             if tool == "ida_list_functions":
-                with IdaSession(b) as ida:
-                    fns = ida.list_functions(args.get("filter"))
-                    return {"count": len(fns),
-                            "functions": [{"addr": hex(f["addr"]), "name": f["name"],
-                                           "size": f["size"]} for f in fns[:500]]}
+                fns = self._get_ida().list_functions(args.get("filter"))
+                return {"count": len(fns),
+                        "functions": [{"addr": hex(f["addr"]), "name": f["name"],
+                                       "size": f["size"]} for f in fns[:500]]}
             if tool == "ida_decompile":
-                with IdaSession(b) as ida:
-                    r = ida.decompile(args["name_or_addr"])
-                    return {"pseudocode": r["pseudocode"][:5000],
-                            "data_refs": r.get("data_refs", []), "callees": r.get("callees", [])}
+                r = self._get_ida().decompile(args["name_or_addr"])
+                return {"pseudocode": r["pseudocode"][:5000],
+                        "data_refs": r.get("data_refs", []), "callees": r.get("callees", [])}
             if tool == "ida_read_bytes":
-                with IdaSession(b) as ida:
-                    return ida.get_bytes(args["name_or_addr"], int(args["size"]))
+                return self._get_ida().get_bytes(args["name_or_addr"], int(args["size"]))
             if tool == "run_python":
                 return _run_python(args["code"], binary=b)
             if tool == "solve_locate":
@@ -224,14 +247,16 @@ class ReactExecutor:
             for step in range(1, self.max_steps + 1):
                 if self.time_budget and time.time() - start > self.time_budget:
                     self._log("time_budget_exceeded", step=step)
-                    return {"flag": None, "steps": step, "error": "超时间预算", "state": self.state}
+                    return {"flag": None, "steps": step, "error": "超时间预算",
+                            "state": self.state, "trace": ctx.step_notes[-15:]}
                 messages = ctx.build_messages(SYSTEM_PROMPT, plan)  # 有界:system+WM+最近window步
                 text = self.client.complete(messages)
                 self._log("executor_output", step=step, text=text[:800], ctx_msgs=len(messages))
                 kind, payload = parse_step(text)
                 if kind == "final":
                     self._log("flag_found", step=step, flag=payload)
-                    return {"flag": payload, "steps": step, "state": self.state}
+                    return {"flag": payload, "steps": step, "state": self.state,
+                            "trace": ctx.step_notes[-15:]}
                 if kind == "action":
                     tool, args = payload["tool"], payload["args"]
                     sig = json.dumps(payload, sort_keys=True, ensure_ascii=False)
@@ -252,6 +277,8 @@ class ReactExecutor:
                     ctx.push_exchange(text, obs_txt)
                 else:
                     ctx.push_exchange(text, "格式错误。请只输出一行 ACTION: {json} 或 FINAL: <flag>。")
-            return {"flag": None, "steps": self.max_steps, "error": "达到步数上限", "state": self.state}
+            return {"flag": None, "steps": self.max_steps, "error": "达到步数上限",
+                    "state": self.state, "trace": ctx.step_notes[-15:]}
         finally:
             store.close()
+            self._close_ida()

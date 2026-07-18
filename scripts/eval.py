@@ -88,11 +88,11 @@ def score(my_flag, truth: set) -> bool:
 
 def run_one(binary: Path, run_id: str, budget: int) -> dict:
     t = time.time()
-    soft = max(30, budget - 25)   # executor 软预算,略小于子进程硬超时,好让日志落盘
+    # 全局预算=budget(跨10轮共享);子进程硬超时留 +40s 余量,好让全局 deadline 先优雅触发
     try:
         p = subprocess.run(
-            [sys.executable, "-m", "antirev.solve_one", str(binary), run_id, "1", "40", str(soft)],
-            capture_output=True, text=True, timeout=budget, cwd=str(ROOT))
+            [sys.executable, "-m", "antirev.solve_one", str(binary), run_id, "9", "15", str(budget)],
+            capture_output=True, text=True, timeout=budget + 40, cwd=str(ROOT))
         dt = time.time() - t
         for ln in reversed(p.stdout.splitlines()):
             if ln.startswith("__RESULT__"):

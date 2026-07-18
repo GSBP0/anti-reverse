@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 import json
+import time
 
 from antirev.react_executor import ReactExecutor
 from antirev.tools import analyze_tools as A
@@ -39,8 +40,13 @@ def make_planner(client, logger=None):
         replan = state.get("replan_count", 0)
         parts = [f"## 确定性预分析\n{_fmt_pre(pre)}"]
         if replan and state.get("evidence"):
-            parts.append(f"\n## 上一轮执行证据(第{replan}次重规划,请据此改进计划)\n"
-                         f"{json.dumps(state['evidence'][-1], ensure_ascii=False)[:1500]}")
+            last = state["evidence"][-1]
+            trace = last.get("trace") or []
+            parts.append(f"\n## 第{replan}次重规划:上一轮({last.get('steps')}步)未解出。\n"
+                         f"上一轮做过的步骤:\n" + "\n".join(f"  {t}" for t in trace[-15:]))
+            parts.append("请**换一个不同的思路/工具/参数**改进计划(别重复上一轮的失败路径)。"
+                         "如密码题解出乱码→换 endian/rounds;angr 超时→改读算法写 run_python;"
+                         "找不到函数→ida_list_functions;数据读错→按 data_refs 真实地址。")
         parts.append("\n据此判断题型并产出 Plan。")
         plan = client.complete([{"role": "system", "content": PLANNER_SYS},
                                 {"role": "user", "content": "\n".join(parts)}], max_tokens=900)
@@ -50,17 +56,21 @@ def make_planner(client, logger=None):
     return planner_node
 
 
-def make_executor(client, logger=None, max_steps=60, time_budget=None):
+def make_executor(client, logger=None, max_steps=25, deadline=None, db_path=None):
     def executor_node(state):
         binary = state["binary"]
+        remaining = (deadline - time.time()) if deadline else None
+        if remaining is not None and remaining <= 5:      # 全局预算用尽
+            return {"status": "stuck", "replan_count": state.get("replan_count", 0) + 1}
         task = (f"题目文件: {binary}\n\n## 预分析\n{_fmt_pre(state.get('pre_analysis', {}))}\n\n"
                 f"## Plan\n{state.get('plan', '')}\n\n按 Plan 解出 flag,拿到后用 FINAL 输出。")
         ex = ReactExecutor(binary, client=client, logger=logger, max_steps=max_steps,
-                           time_budget=time_budget)
+                           time_budget=remaining, db_path=db_path)   # 跨轮共享缓存 db_path
         result = ex.run(task)
         ev = list(state.get("evidence", []))
         ev.append({"replan": state.get("replan_count", 0), "steps": result.get("steps"),
-                   "flag": result.get("flag"), "last_state": result.get("state")})
+                   "flag": result.get("flag"), "trace": result.get("trace"),
+                   "last_state": result.get("state")})
         upd = {"executor_result": result, "evidence": ev}
         if result.get("flag"):
             upd["flag"], upd["status"] = result["flag"], "done"
@@ -71,10 +81,12 @@ def make_executor(client, logger=None, max_steps=60, time_budget=None):
     return executor_node
 
 
-def make_router(max_replan=2):
+def make_router(max_replan=9, deadline=None):
     def route_after_executor(state):
         if state.get("flag"):
             return "done"
+        if deadline and time.time() > deadline:      # 全局时间预算到点
+            return "fail"
         if state.get("replan_count", 0) <= max_replan:
             return "replan"
         return "fail"

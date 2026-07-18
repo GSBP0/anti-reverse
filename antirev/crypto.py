@@ -226,3 +226,53 @@ def xor_bytes(data: bytes, key) -> bytes:
     if isinstance(key, int):
         key = bytes([key])
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
+
+# ——————————————————— 智能试解(免猜 endian/rounds) ———————————————————
+def _flag_like(b: bytes, hint=None) -> bool:
+    if not b:
+        return False
+    printable = sum(1 for c in b if 32 <= c < 127) / len(b)
+    s = b.decode("latin1")
+    if hint:
+        return hint.lower() in s.lower()
+    return printable > 0.85
+
+
+def smart_decrypt(algo, ciphertext, key, hint=None,
+                  rounds_list=(32, 64), deltas=(_DELTA, 0x61C88647)) -> list:
+    """自动遍历 endian×rounds×delta 变体解密,返回候选(flag_like 的排前)。免去模型猜参数。
+
+    algo: 'tea'|'xtea'|'xxtea'|'rc4'。hint: flag 前缀(如 'NSSCTF'),给了则只认含它的候选。
+    返回 [{"variant":..., "result":str, "flag_like":bool}, ...]。
+    """
+    if isinstance(ciphertext, str):
+        ciphertext = bytes.fromhex(ciphertext)
+    if isinstance(key, str):
+        key = bytes.fromhex(key) if all(c in "0123456789abcdefABCDEF" for c in key) else key.encode()
+    cands = []
+    if algo == "rc4":
+        r = rc4(ciphertext, key)
+        cands.append({"variant": "rc4", "result": r.decode("latin1"), "flag_like": _flag_like(r, hint)})
+    else:
+        block_fns = {"tea": tea_decrypt_bytes, "xtea": xtea_decrypt_bytes}
+        for endian in ("little", "big"):
+            if algo == "xxtea":
+                for delta in deltas:
+                    try:
+                        r = xxtea_decrypt_bytes(ciphertext, key, delta=delta, endian=endian)
+                        cands.append({"variant": f"xxtea,{endian},delta={hex(delta)}",
+                                      "result": r.decode("latin1"), "flag_like": _flag_like(r, hint)})
+                    except Exception:
+                        pass
+            elif algo in block_fns:
+                for rounds in rounds_list:
+                    for delta in deltas:
+                        try:
+                            r = block_fns[algo](ciphertext, key, rounds=rounds, delta=delta, endian=endian)
+                            cands.append({"variant": f"{algo},{endian},r={rounds},delta={hex(delta)}",
+                                          "result": r.decode("latin1"), "flag_like": _flag_like(r, hint)})
+                        except Exception:
+                            pass
+    cands.sort(key=lambda c: not c["flag_like"])
+    return cands
