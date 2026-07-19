@@ -187,7 +187,7 @@ def main():
             ok = score(r.get("flag"), truth)
             rec = {"pid": pid, "title": pdir.name, "binary": binary.name,
                    "my_flag": r.get("flag"), "truth": sorted(truth)[:3], "has_truth": bool(truth),
-                   "status": r.get("status"), "solved": ok,
+                   "status": r.get("status"), "solved": ok, "error": r.get("error"),
                    "steps": steps_from_log(run_id), "wall_s": r.get("wall_s")}
         solved += rec["solved"]
         results.append(rec)

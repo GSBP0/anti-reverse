@@ -36,7 +36,10 @@ def _fmt_pre(pre) -> str:
 def make_planner(client, logger=None):
     def planner_node(state):
         binary = state["binary"]
-        pre = state.get("pre_analysis") or _pre_analyze(binary)
+        try:
+            pre = state.get("pre_analysis") or _pre_analyze(binary)
+        except Exception:
+            pre = {"file_info": {}, "packer": {}, "hint_strings": [], "num_strings": 0}
         replan = state.get("replan_count", 0)
         parts = [f"## 确定性预分析\n{_fmt_pre(pre)}"]
         if replan and state.get("evidence"):

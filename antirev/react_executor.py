@@ -60,6 +60,11 @@ SYSTEM_PROMPT = f"""你是逆向 Executor,目标是解出 flag。开局先 analy
     - 若 smart_decrypt 全不像 flag → 算法可能是**魔改**,需按伪代码**精确复现**自定义运算再逆。脚本里正向重算自验,print(flag)。
 (B) 符号执行:若是"读输入→逐步比较→到达成功分支"型,solve_locate → solve_angr(stdin_len=?) → solve_verify。
 
+**关键纪律(血泪教训,务必遵守)**:
+- **读懂逻辑就立刻动手**:一旦从伪代码看清了校验/加密逻辑(哪怕是魔改变体),**马上用 run_python 写逆运算求解**,别再反编译更多函数空转 —— 大量失败都是"看懂了却一直在探索没去解"。
+- **魔改算法照抄再逆**:非标准算法就按伪代码**逐条精确复现**每步运算(异或/加减/移位/查表/自定义RC4),取硬编码密文+密钥,run_python 里正向重算比对自验,再逆推出 flag。
+- **找不到 main**:list_functions 空或没 main 时,先 analyze 看入口,再 ida_decompile 直接传**入口地址**(如 "0x401000")从入口读起,顺 callees 往下。
+
 每步只输出下面之一(可先写一行 THOUGHT: 简述):
 ACTION: {{"tool":"<名>","args":{{...}}}}
 FINAL: <flag>
@@ -138,14 +143,21 @@ class ChatClient:
         self.model = model or config.MODEL_NAME
         self.think = think
 
-    def complete(self, messages, max_tokens=800, temperature=0.0, timeout=180):
+    def complete(self, messages, max_tokens=800, temperature=0.0, timeout=180, retries=3):
         body = {"model": self.model, "messages": messages,
                 "max_tokens": max_tokens, "temperature": temperature}
         if not self.think:
             body["chat_template_kwargs"] = {"enable_thinking": False}
-        r = requests.post(self.base + "/chat/completions", json=body, timeout=timeout)
-        msg = r.json()["choices"][0]["message"]
-        return msg.get("content") or msg.get("reasoning") or ""
+        # 重试:mlx 服务持续高负载下偶发超时/异常/畸形响应 → 别让整题崩(§11 robustness)
+        for attempt in range(retries):
+            try:
+                r = requests.post(self.base + "/chat/completions", json=body, timeout=timeout)
+                msg = r.json()["choices"][0]["message"]
+                return msg.get("content") or msg.get("reasoning") or ""
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(2 * (attempt + 1))
+        return ""   # 重试全失败 → 返回空,上层当空输出处理,不崩题
 
 
 class ReactExecutor:
@@ -281,53 +293,57 @@ class ReactExecutor:
                     return {"flag": None, "steps": step,
                             "error": f"{int(self.stuck_seconds // 60)}min无新进展(疑似卡错误方向,提前判失败)",
                             "state": self.state, "trace": ctx.step_notes[-15:]}
-                messages = ctx.build_messages(SYSTEM_PROMPT, plan)  # 有界:system+WM+最近window步
-                text = self.client.complete(messages)
-                self._log("executor_output", step=step, text=text[:800], ctx_msgs=len(messages))
-                kind, payload = parse_step(text)
-                if kind == "final":
-                    # 反假阳性:flag 必须在某工具输出里真实出现过(否则疑似编造)
-                    inner = (payload[payload.find("{") + 1:payload.rfind("}")]
-                             if "{" in payload and "}" in payload else payload)
-                    grounded = (store.contains(self.run_id, payload)
-                                or (len(inner) >= 4 and store.contains(self.run_id, inner)))
-                    if not grounded:
-                        self._log("final_rejected", step=step, flag=payload, reason="未在工具输出中出现,疑似编造")
-                        ctx.push_exchange(text,
-                            "拒绝该 FINAL:你给的 flag 没有在任何工具输出里出现过——不要凭感觉编造!"
-                            "必须用 run_python 真正算出并 print 出 flag(建议正向重算比对密文自验),确认后再 FINAL。")
+                try:
+                    messages = ctx.build_messages(SYSTEM_PROMPT, plan)  # 有界:system+WM+最近window步
+                    text = self.client.complete(messages)
+                    if not text:      # 模型调用重试后仍空 → 跳过本步(不崩题)
                         continue
-                    self._log("flag_found", step=step, flag=payload)
-                    return {"flag": payload, "steps": step, "state": self.state,
-                            "trace": ctx.step_notes[-15:]}
-                if kind == "action":
-                    tool, args = payload["tool"], payload["args"]
-                    sig = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-                    repeat = repeat + 1 if sig == last_sig else 0
-                    last_sig = sig
-                    tool_run = tool_run + 1 if tool == last_tool else 0
-                    last_tool = tool
-                    obs = self._dispatch(tool, args, store)
-                    self._log("tool_result", step=step, tool=tool, args=args, obs=obs)
-                    obs_txt = ctx.record(step, tool, args, obs)
-                    # 新进展检测(§11):只有"朝解题前进"的**新**进展才重置 stuck(见 _is_progress):
-                    # 产出 flag 样候选 / angr found / verify accepted / locate 到 / 脱壳成功。
-                    # 纯探索与乱码失败尝试都不算 → 10min 无真进展即判卡错误方向,提前失败。
-                    if _is_progress(tool, obs):
-                        sig = f"{tool}:{ctx._brief(tool, obs)}"
-                        if sig not in self._progress["seen"]:
-                            self._progress["seen"].add(sig)
-                            self._progress["last"] = time.time()  # 压缩+存全量,返回上下文视图
-                    if repeat >= 2 or tool_run >= 4:  # 无进展检测(§3.4/§11)
-                        self._log("no_progress", step=step, tool=tool)
-                        obs_txt += ("\n\n[系统提示] 你在无进展地重复。停!换完全不同的思路:"
-                                    "找不到函数就 ida_list_functions 列全部按名定位;"
-                                    "读数据按 data_refs 真实地址(别用显示名);"
-                                    "读懂算法后 run_python 写逆运算;或试 solve_angr。别再瞎猜地址。")
-                        repeat, tool_run = 0, 0
-                    ctx.push_exchange(text, obs_txt)
-                else:
-                    ctx.push_exchange(text, "格式错误。请只输出一行 ACTION: {json} 或 FINAL: <flag>。")
+                    self._log("executor_output", step=step, text=text[:800], ctx_msgs=len(messages))
+                    kind, payload = parse_step(text)
+                    if kind == "final":
+                        # 反假阳性:flag 必须在某工具输出里真实出现过(否则疑似编造)
+                        inner = (payload[payload.find("{") + 1:payload.rfind("}")]
+                                 if "{" in payload and "}" in payload else payload)
+                        grounded = (store.contains(self.run_id, payload)
+                                    or (len(inner) >= 4 and store.contains(self.run_id, inner)))
+                        if not grounded:
+                            self._log("final_rejected", step=step, flag=payload, reason="未在工具输出中出现,疑似编造")
+                            ctx.push_exchange(text,
+                                "拒绝该 FINAL:你给的 flag 没有在任何工具输出里出现过——不要凭感觉编造!"
+                                "必须用 run_python 真正算出并 print 出 flag(建议正向重算比对密文自验),确认后再 FINAL。")
+                            continue
+                        self._log("flag_found", step=step, flag=payload)
+                        return {"flag": payload, "steps": step, "state": self.state,
+                                "trace": ctx.step_notes[-15:]}
+                    if kind == "action":
+                        tool, args = payload["tool"], payload["args"]
+                        sig = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+                        repeat = repeat + 1 if sig == last_sig else 0
+                        last_sig = sig
+                        tool_run = tool_run + 1 if tool == last_tool else 0
+                        last_tool = tool
+                        obs = self._dispatch(tool, args, store)
+                        self._log("tool_result", step=step, tool=tool, args=args, obs=obs)
+                        obs_txt = ctx.record(step, tool, args, obs)
+                        # 新进展检测(§11):只有"朝解题前进"的**新**进展才重置 stuck(见 _is_progress)。
+                        if _is_progress(tool, obs):
+                            sig = f"{tool}:{ctx._brief(tool, obs)}"
+                            if sig not in self._progress["seen"]:
+                                self._progress["seen"].add(sig)
+                                self._progress["last"] = time.time()
+                        if repeat >= 2 or tool_run >= 4:  # 无进展检测(§3.4/§11)
+                            self._log("no_progress", step=step, tool=tool)
+                            obs_txt += ("\n\n[系统提示] 你在无进展地重复。停!换完全不同的思路:"
+                                        "找不到函数就 ida_list_functions 列全部按名定位;"
+                                        "读数据按 data_refs 真实地址(别用显示名);"
+                                        "读懂算法后 run_python 写逆运算;或试 solve_angr。别再瞎猜地址。")
+                            repeat, tool_run = 0, 0
+                        ctx.push_exchange(text, obs_txt)
+                    else:
+                        ctx.push_exchange(text, "格式错误。请只输出一行 ACTION: {json} 或 FINAL: <flag>。")
+                except Exception as e:      # 未捕获异常 → 记录并继续下一步,绝不崩整题(§11)
+                    self._log("step_error", step=step, error=repr(e)[:200])
+                    continue
             return {"flag": None, "steps": self.max_steps, "error": "达到步数上限",
                     "state": self.state, "trace": ctx.step_notes[-15:]}
         finally:
