@@ -9,3 +9,19 @@ logs/
 wheelhouse/
 tests/samples/flagcheck
 .DS_Store
+
+# 第三方仓库克隆(独立 git 仓库,与本项目无关)
+grok-build/
+
+# IDA 分析自动生成的数据库缓存(跑一次 eval 就变,可从二进制重新生成)
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# 工具跑出来的解包/修复产物(可从原附件重新生成)
+*_extracted/
+extracted_*/
+*_fixed.exe
+*.dump.exe
