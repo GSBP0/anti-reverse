@@ -7,8 +7,14 @@ build/
 dist/
 logs/
 wheelhouse/
-tests/samples/flagcheck
 .DS_Store
+
+# 仓库只跟踪 antirev/ 引擎代码;以下本地保留、不入库
+# data/ 是题库 1.7GB(150题附件+题解),另行分发
+data/
+docs/
+scripts/
+tests/
 
 # 第三方仓库克隆(独立 git 仓库,与本项目无关)
 grok-build/
