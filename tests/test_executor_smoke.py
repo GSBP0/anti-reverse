@@ -28,9 +28,7 @@ def test_executor_constructs_without_endpoint(sample):
     assert build_executor(sample) is not None
 
 
-@pytest.mark.skip(reason="本端点(mlx_lm.server)不支持原生 tool_calls;"
-                         "模型驱动端到端见 test_react_executor(自研文本协议)。"
-                         "本 create_react_agent 路径留作支持原生 tool_calls 的端点备用。")
+@pytest.mark.skipif(not _endpoint_up(), reason="model endpoint offline")
 def test_executor_solves_flagcheck(sample, expected_flag):
     agent = build_executor(sample)
     plan = open(PLAN).read()

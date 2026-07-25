@@ -20,8 +20,11 @@ from antirev.graph.nodes import make_planner, make_executor, make_router
 def build_graph(client, logger=None, max_replan=9, max_steps=15, deadline=None, db_path=None,
                 stuck_seconds=None, progress=None):
     g = StateGraph(AgentState)
-    g.add_node("planner", make_planner(client, logger))
-    g.add_node("executor", make_executor(client, logger, max_steps, deadline, db_path,
+    # planner 开 thinking + 温度 0.4;executor 关 thinking + 温度 0.35。从传入 client 派生同端点(base/model)的两个专用 client。
+    planner_client = ChatClient(client.base, client.model, think=True, temperature=0.4)
+    executor_client = ChatClient(client.base, client.model, think=False, temperature=0.35)
+    g.add_node("planner", make_planner(planner_client, logger))
+    g.add_node("executor", make_executor(executor_client, logger, max_steps, deadline, db_path,
                                          stuck_seconds, progress))
     g.set_entry_point("planner")
     g.add_edge("planner", "executor")
@@ -34,7 +37,8 @@ def solve(binary, client=None, logger=None, max_replan=9, max_steps=15, budget=N
     """双 Agent 端到端解一道题(最多 max_replan+1 轮 planner↔executor)。返回 {flag,status,replans,plan}。"""
     client = client or ChatClient()
     deadline = (time.time() + budget) if budget else None
-    progress = {"last": time.time(), "seen": set()}   # 跨轮共享进展追踪(stuck 检测用)
+    progress = {"last": time.time(), "seen": set(),   # 跨轮共享进展追踪(stuck 检测/B1 断环用)
+                "loop": {"sig": None, "tool": None, "nth": "", "n": 0}}
     run_id = getattr(logger, "run_id", None) or "solve"
     db_path = str(config.LOG_DIR / f"{run_id}.db")   # 跨轮共享缓存(IDA分析不重复)
     Path(db_path).unlink(missing_ok=True)             # 每次求解清旧缓存

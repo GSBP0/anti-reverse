@@ -1,7 +1,7 @@
 """辅助分析工具(§5.3):确定性预处理,喂给 Planner 判型 / 供 Executor 脱壳。
 
 设计:file_info/entropy/detect_packer 纯 Python(无外部依赖,始终可用);
-unpack_upx 用 upx CLI;floss/binwalk/diec 缺失时优雅降级(返回 ok=False + 原因),不阻塞。
+floss/binwalk/diec 缺失时优雅降级(返回 ok=False + 原因),不阻塞。
 """
 from __future__ import annotations
 import math
@@ -68,20 +68,8 @@ def detect_packer(binary) -> dict:
     if shutil.which("diec"):
         r = run_isolated(["diec", str(binary)], timeout=30)
         if r.returncode == 0 and r.stdout.strip():
-            hints.append("diec: " + r.stdout.strip()[:300])
+            hints.append("diec: " + r.stdout.strip())
     return {"hints": sorted(set(hints)), "packed_likely": bool(hints)}
-
-
-def unpack_upx(binary, out=None) -> dict:
-    if not shutil.which("upx"):
-        return {"ok": False, "error": "upx 未安装"}
-    out = str(out or (str(binary) + ".unpacked"))
-    shutil.copy(binary, out)
-    r = run_isolated(["upx", "-d", out], timeout=60)
-    if r.returncode == 0:
-        return {"ok": True, "out": out}
-    Path(out).unlink(missing_ok=True)
-    return {"ok": False, "error": (r.stderr or r.stdout)[-300:]}
 
 
 def floss_strings(binary, min_len=5) -> dict:
@@ -91,14 +79,14 @@ def floss_strings(binary, min_len=5) -> dict:
     r = run_isolated([exe, "--minimum-length", str(min_len), "-q", str(binary)], timeout=180)
     if r.timed_out:
         return {"ok": False, "error": "floss timeout"}
-    return {"ok": r.returncode == 0, "output": r.stdout[-6000:]}
+    return {"ok": r.returncode == 0, "output": r.stdout}
 
 
 def binwalk_scan(binary) -> dict:
     if not shutil.which("binwalk"):
         return {"ok": False, "error": "binwalk 未安装"}
     r = run_isolated(["binwalk", str(binary)], timeout=60)
-    return {"ok": r.returncode == 0, "output": r.stdout[-3000:]}
+    return {"ok": r.returncode == 0, "output": r.stdout}
 
 
 def ascii_strings(binary, min_len=5, limit=120) -> list:

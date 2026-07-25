@@ -13,8 +13,8 @@ from antirev.graph.build import solve
 def main():
     binary = sys.argv[1]
     run_id = sys.argv[2] if len(sys.argv) > 2 else "eval"
-    max_replan = int(sys.argv[3]) if len(sys.argv) > 3 else 19    # 20 轮 planner↔executor
-    max_steps = int(sys.argv[4]) if len(sys.argv) > 4 else 30     # 每轮 executor 最多 30 tool call
+    max_replan = int(sys.argv[3]) if len(sys.argv) > 3 else 9999  # 不限轮数, 仅靠 budget/stuck 时间限制
+    max_steps = int(sys.argv[4]) if len(sys.argv) > 4 else 15     # 每轮 executor 最多 15 tool call
     budget = int(sys.argv[5]) if len(sys.argv) > 5 else None      # 单题总时长上限(秒)
     stuck_seconds = int(sys.argv[6]) if len(sys.argv) > 6 else 600  # 无新进展 10min → 提前判失败
     logger = RunLogger(run_id=run_id, log_dir=config.LOG_DIR)

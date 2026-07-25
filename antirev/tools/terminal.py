@@ -1,25 +1,30 @@
-"""terminal 工具(§5.4):杂项兜底命令执行。
+"""terminal 工具:本地命令执行(用户要求全开——无白名单/黑名单)。
 
-边界:angr/z3/unicorn/floss/DIE 都是一等厚工具,**不走**这里裸调;terminal 只用于临时
-xxd/strings/自定义脚本等。强制超时 + 受限工作目录 + 捕获 stdout/stderr/rc,输出截断防爆上下文。
+经 `bash -c` 执行,支持管道/重定向/复合命令;保留强制超时 + 受限工作目录 + 捕获 stdout/stderr/rc,
+输出截断防爆上下文。agent 可自由用系统 CLI:decompyle3/uncompyle6(反编译 pyc)、
+pyinstxtractor-ng(解 PyInstaller)、upx、binwalk、objdump/nm/readelf、strings|grep 等。
 """
 from __future__ import annotations
-import shlex
 
 from antirev import config
 from antirev.isolation.subprocess_runner import run_isolated
 
 
 def terminal(command: str, workdir=None, timeout=None) -> dict:
-    """执行本地命令。command 为 shell 风格字符串(经 shlex 拆分,不走 shell 注入路径)。"""
+    """执行任意本地 shell 命令(无白名单/黑名单,用户要求全开)。
+
+    经 `bash -c` 跑,支持管道/重定向/&&/$() 等 shell 特性;仅保留超时 + 工作目录隔离防卡死。
+    """
+    if not command or not command.strip():
+        return {"returncode": 1, "stdout": "", "stderr": "空命令", "timed_out": False}
     r = run_isolated(
-        shlex.split(command),
+        ["bash", "-c", command],
         timeout=timeout or config.TERMINAL_TIMEOUT,
         cwd=str(workdir) if workdir else None,
     )
     return {
         "returncode": r.returncode,
-        "stdout": r.stdout[-4000:],
-        "stderr": r.stderr[-2000:],
+        "stdout": r.stdout,
+        "stderr": r.stderr,
         "timed_out": r.timed_out,
     }

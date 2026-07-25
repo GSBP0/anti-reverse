@@ -49,6 +49,14 @@ class MemoryStore:
         return {"id": artifact_id, "tool": row[0], "args": json.loads(row[1]),
                 "summary": row[2], "full_text": row[3]}
 
+    def list_artifacts(self, run_id) -> list:
+        """按时序列出本 run 的所有工具调用(含全文 obs),供跨轮重建台账(§6 结构化记忆)。"""
+        rows = self.conn.execute(
+            "SELECT id,tool,args_json,summary,full_text FROM artifacts WHERE run_id=? ORDER BY id",
+            (run_id,)).fetchall()
+        return [{"id": i, "tool": t, "args": json.loads(a or "{}"),
+                 "summary": s, "full_text": f} for (i, t, a, s, f) in rows]
+
     def find_cached(self, run_id, tool, args) -> dict | None:
         row = self.conn.execute(
             "SELECT id,summary,full_text FROM artifacts "

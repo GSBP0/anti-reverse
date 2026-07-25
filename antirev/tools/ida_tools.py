@@ -82,7 +82,7 @@ class IdaSession:
         line = self.p.stdout.readline()
         if not line:
             err = self.p.stderr.read() if self.p.stderr else ""
-            raise IdaError(f"IDA worker 意外退出: {err[-600:]}")
+            raise IdaError(f"IDA worker 意外退出: {err}")
         return json.loads(line)
 
     def _rpc(self, cmd, **args):
@@ -105,6 +105,13 @@ class IdaSession:
     def decompile(self, name_or_addr):
         return self._rpc("decompile", name_or_addr=name_or_addr)
 
+    def disasm(self, name_or_addr, count=80, end=None):
+        """反汇编:hexrays 失败兜底;带 end 做 [ea,end) 范围局部下钻(outline 段,免整函数 dump)。"""
+        args = {"name_or_addr": name_or_addr, "count": int(count)}
+        if end is not None:
+            args["end"] = end
+        return self._rpc("disasm", **args)
+
     def strings(self, filter=None):
         return self._rpc("strings", filter=filter)
 
@@ -118,3 +125,20 @@ class IdaSession:
     def get_bytes(self, name_or_addr, size):
         """读取指定数据(名或地址)的原始字节,返回 {addr,size,hex}。用于取加密常量/密文等。"""
         return self._rpc("get_bytes", name_or_addr=name_or_addr, size=int(size))
+
+    def data_provenance(self, name_or_addr, size=16):
+        """5.1:查数据地址的写交叉引用(SMC护栏)。返回 {static_hex, write_xrefs, smc_suspected}。"""
+        return self._rpc("data_provenance", name_or_addr=name_or_addr, size=int(size))
+
+    def deobf_scan(self):
+        """C2.3:混淆/保护体检(反调试/SMC/rdtsc 一次扫全)。"""
+        return self._rpc("deobf_scan")
+
+    def score_functions(self, top=12):
+        """按'像不像校验/加密函数'给函数打分排序(F:stripped 二进制定位关键函数)。
+        返回 [{addr,name,size,score,why}],供模型优先反编译高分函数,免在无名函数里乱翻。"""
+        return self._rpc("score_functions", top=int(top))
+
+    def outline(self, name_or_addr, min_insn=None):
+        """大函数分段导航地图(过门槛才有,否则 None);min_insn 显式给出可放宽门槛(测试/强制)。"""
+        return self._rpc("outline", name_or_addr=name_or_addr, min_insn=min_insn)

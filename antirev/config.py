@@ -33,6 +33,7 @@ LOG_DIR = Path(os.environ.get("ANTIREV_LOG_DIR", str(PROJECT_ROOT / "logs")))
 SUCCESS_KEYWORDS = [
     "correct", "congrat", "right", "well done", "good job", "you win",
     "you got", "accepted", "success", "solved", "great job", "nice job",
+    "get flag", "get the flag",   # 2000 funnyre 正解输出 "you get flag!"(原 "you got" 匹配不上)
 ]
 FAIL_KEYWORDS = [
     "wrong", "incorrect", "invalid", "denied", "try again", "nope",

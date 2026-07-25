@@ -47,7 +47,7 @@ _DRIVER = textwrap.dedent(r'''
         try:
             st = build_state(strat, flag, stdin)
         except Exception as e:
-            result = {"found": False, "stdin": "", "error": f"{strat}: {e!r}"[:300]}
+            result = {"found": False, "stdin": "", "error": f"{strat}: {e!r}"}
             continue
         for byte in flag.chop(8):      # 可打印约束(排空白,防 scanf 提前截断)
             st.solver.add(claripy.And(byte >= 0x21, byte <= 0x7e))
@@ -64,7 +64,7 @@ _DRIVER = textwrap.dedent(r'''
         try:
             simgr.explore(find=p["find"], avoid=p.get("avoid", []), num_find=1, step_func=_step)
         except Exception as e:
-            result = {"found": False, "stdin": "", "error": f"{strat} explore: {e!r}"[:300]}
+            result = {"found": False, "stdin": "", "error": f"{strat} explore: {e!r}"}
             continue
         if simgr.found:
             s = simgr.found[0]
@@ -94,4 +94,4 @@ def solve_angr(binary, find, avoid=None, input_kind="stdin", stdin_len=32,
     try:
         return json.loads(r.stdout.strip().splitlines()[-1])
     except Exception:
-        return {"found": False, "stdin": "", "error": (r.stderr or r.stdout)[-1000:]}
+        return {"found": False, "stdin": "", "error": (r.stderr or r.stdout)}

@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 import base64 as _b64
+import re
 import struct
 
 _MASK = 0xFFFFFFFF
@@ -232,8 +233,13 @@ def xor_bytes(data: bytes, key) -> bytes:
 def _flag_like(b: bytes, hint=None) -> bool:
     if not b:
         return False
-    printable = sum(1 for c in b if 32 <= c < 127) / len(b)
     s = b.decode("latin1")
+    printable = sum(1 for c in b if 32 <= c < 127) / len(b)
+    # 通用 flag 格式命中即算(前缀{可打印体},如 NSSCTF{...}/flag{...}):放宽——不苛求 hint 精确匹配、
+    # 也忽略尾部标点。7071 教训:XTEA 解出 NSSCTF{xtea_is_also_delicious!!},因模型传 hint='flag'
+    # 不匹配 NSSCTF 而被判 False → 正解被丢、白跑 26 步。
+    if re.search(r"[A-Za-z0-9_]{2,}\{[\x20-\x7e]{2,}\}", s):
+        return True
     if hint:
         return hint.lower() in s.lower()
     return printable > 0.85

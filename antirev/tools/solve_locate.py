@@ -60,13 +60,21 @@ def _from_raw_elf(binary, ida):
     return find, avoid, evidence
 
 
-def locate_targets(binary: str) -> dict:
-    with IdaSession(binary) as ida:
+def locate_targets(binary: str, ida=None) -> dict:
+    """ida 传入时复用(executor 常驻 session)——避免开第二个 IdaSession 撞同一 IDA 数据库锁(rc=4)。"""
+    own = ida is None
+    if own:                       # 独立调用(如测试)才自己开
+        ida = IdaSession(binary)
+        ida.__enter__()
+    try:
         find, avoid, evidence = _from_ida_strings(ida)
         if not find and not avoid:
             f2, a2, e2 = _from_raw_elf(binary, ida)
             find, avoid, evidence = f2, a2, e2
         # 含首个 find 的函数起始(通常是 main/check),供 angr 从此起跳过 CRT
         func_hint = ida.func_start(find[0]) if find else None
+    finally:
+        if own:
+            ida.__exit__(None, None, None)
     return {"find": sorted(set(find)), "avoid": sorted(set(avoid)),
             "evidence": evidence, "func_hint": func_hint}
