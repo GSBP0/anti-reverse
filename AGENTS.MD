@@ -38,3 +38,13 @@ Example:
 termianl:
 args:whoaml
 response: command not found: whoaml
+## Web 作战台
+单题可视化控制台(`antirev/web/`):题目参数输入、开始/暂停/继续/停止、Human-in-the-loop 提示、
+实时做题进度。启动:
+```bash
+conda run -n antirev python -m antirev.web.server   # → http://127.0.0.1:8765
+```
+Web 只是日志消费者 + 控制文件写入者(tail `logs/<run_id>.jsonl`、写 `.ctl`/`.hint`),不参与解题——
+Web 崩了 agent 照跑,agent 崩了 Web 照活,历史 run 可用同一套渲染回放。详见 `antirev/web/README.md`。
+
+批量评测仍用 `scripts/eval.py`,不在本界面。
