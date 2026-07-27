@@ -193,25 +193,40 @@ class Ledger:
 
     # —— 渲染(常驻上下文;每类去重+截断,空间有界)——
     def render(self) -> str:
+        """分区顺序 = **从最稳定到最易变**,这是刻意的。
+
+        台账整体落在动态尾区,但它内部同样存在前缀:越靠前的分区越稳定,
+        前缀就越长、KV 复用越多。实测(未排序前)尾区自身命中率只有 27% 且随步数递减
+        (41%→18%),罪魁是"已反编译函数(**N个**...)"这种**行内计数** —— 每加一个函数,
+        计数一变,从那个字符起整个尾区全废。
+
+        所以:①纯追加的分区(func_map/reads)排前 ②覆盖更新的(scans/outlines)居中
+        ③滑动窗口的(attempts/insights)排最后 ④**任何计数一律移到该分区末尾**,
+        不放在分区首行。
+        """
         lines = ["## 已知台账(所有工具调用结果的持久记录 —— 查过的别重复查,据此决定下一步)"]
-        if self.scans:
-            for k in ("analyze", "unpack", "functions", "key_functions", "floss"):
-                if k in self.scans:
-                    lines.append(f"- {k}: {self.scans[k]}")
+        # ① 纯追加区(新条目只在末尾长出来 → 前缀最稳)
         if self.func_map:
-            lines.append(f"- 已反编译函数({len(self.func_map)}个, addr → 签名 | 算法指纹 | calls | refs):")
+            lines.append("- 已反编译函数(addr → 签名 | 算法指纹 | calls | refs):")
             for key, v in self.func_map.items():
                 calls = ",".join(v["calls"]) if v["calls"] else "-"
                 refs = ",".join(v["refs"]) if v["refs"] else "-"
                 lines.append(f"   {key} {v['sig']} | {v.get('fp') or '-'} | calls {calls} | refs {refs}")
-        if self.func_outlines:
-            lines.append("- 大函数分段导航(★核心段;下钻 ida_disasm(段start, end=段end);逐段理解防遗漏):")
-            for e in self.func_outlines.values():
-                lines.append("  " + render_outline(e["outline"], e["seen"]).replace("\n", "\n  "))
+            lines.append(f"   (共 {len(self.func_map)} 个)")      # 计数放末尾,不污染前缀
         if self.reads:
             lines.append("- 已读字节:")
             for v in self.reads.values():
                 lines.append(f"   {v['addr']} ({v['size']}B) {v['head']}")
+        # ② 覆盖更新区(值会原地改,但键集合增长慢)
+        if self.func_outlines:
+            lines.append("- 大函数分段导航(★核心段;下钻 ida_disasm(段start, end=段end);逐段理解防遗漏):")
+            for e in self.func_outlines.values():
+                lines.append("  " + render_outline(e["outline"], e["seen"]).replace("\n", "\n  "))
+        if self.scans:
+            for k in ("analyze", "unpack", "functions", "key_functions", "floss"):
+                if k in self.scans:
+                    lines.append(f"- {k}: {self.scans[k]}")
+        # ③ 滑动窗口区(会丢最旧 → 整段重排,放最后把影响限制在尾巴上)
         if self.attempts:
             lines.append("- 解题尝试(时序):")
             for a in self.attempts:
