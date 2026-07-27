@@ -134,6 +134,12 @@ SYSTEM_PROMPT = f"""你是逆向 Executor,目标是解出 flag。开局先 analy
 
 _FLAGISH_RE = re.compile(r"[A-Za-z0-9_]{2,}\{[^}]{2,}\}")   # flag 样式,用于 stuck 进展判定 _is_progress
 
+# L3 原地压缩次数上限。超过说明本轮方向可能就是错的 → 转 planner 换思路,而不是无限压着跑。
+MAX_L3_COMPACTS = 2
+# L3 触发阈值。60k 工作区 × 70%(旧为 51k/85%):压缩请求自身也要带上下文(Codex 教训),
+# 且压完要能继续跑而非立刻再触发。
+L3_TOKEN_THRESHOLD = 42000
+
 
 def _is_progress(tool, obs) -> bool:
     """是否算"朝解题前进"的真进展(重置 stuck 计时)。纯探索(反编译/读字节)、乱码/失败尝试都**不**算 ——
@@ -343,6 +349,46 @@ class ReactExecutor:
                 msgs.append({"role": "user", "content": f"字段缺失/空:{miss}。补全后重新调用 report_progress。"})
             self._log("round_summary", summary=d, missing=miss)
             return render_report(d) if d else ""
+        except Exception:
+            return ""
+
+    def _build_handoff(self, ctx) -> str:
+        """L3:让模型写一份交接摘要(强制 context_handoff schema + 与台账交叉校验证据)。
+
+        **压缩请求自身也可能撞上限**(Codex 的教训):此时先做一次激进 L1(protect=1,
+        把几乎所有旧工具全文换成 artifact 引用)腾出空间再重试。方向是"压掉最旧的",
+        因为从旧端削才保得住 prefix cache。腾完仍失败就返回 "" —— 上层退回转 planner,
+        绝不拿半成品摘要覆盖历史。
+        """
+        try:
+            from antirev.tools.report_schema import (HANDOFF, parse_tool_args,
+                                                     render_handoff, validate_handoff)
+            known = ctx.known_evidence()
+            force = {"type": "function", "function": {"name": "context_handoff"}}
+            ask = ("上下文即将压缩。调用 context_handoff 写交接摘要给接着干这道题的下一段会话:"
+                   "已确认事实必须给出台账里真实出现过的证据地址或 artifact#N;"
+                   "试过并失败的写进 failed_attempts(别写成结论);猜测放 hypothesis。")
+            for attempt in range(2):
+                if attempt == 1:
+                    # 首次失败(很可能是压缩请求自己超限)→ 激进 L1 腾空间后重试
+                    freed = ctx.micro_compact(protect=1)
+                    self._log("handoff_retry_after_l1", freed=freed)
+                    if not freed:
+                        return ""
+                msgs = ctx.build_messages(SYSTEM_PROMPT, ctx.goal)
+                msgs.append({"role": "user", "content": ask})
+                for _ in range(2):      # 同一份上下文里最多纠错一次(缺字段/证据对不上)
+                    m = self.client.complete_tools(msgs, max_tokens=3072, timeout=180,
+                                                   tools=[HANDOFF], tool_choice=force)
+                    if m is None:
+                        break           # 疑似超限 → 跳出内层,走外层的 L1 腾空间重试
+                    d = parse_tool_args(m, "context_handoff")
+                    errs = validate_handoff(d, known_evidence=known)
+                    if not errs:
+                        return render_handoff(d)
+                    msgs.append({"role": "user",
+                                 "content": f"交接摘要有问题:{errs}。修正后重新调用 context_handoff。"})
+            return ""
         except Exception:
             return ""
 
@@ -570,13 +616,28 @@ class ReactExecutor:
                     # append-only 历史不再靠滑窗控量,上下文压力由 L1/L3 承接。
                     ctx.micro_compact()
                     messages = ctx.build_messages(SYSTEM_PROMPT, plan)
-                    # 上下文熔断:优先用 mlx 上一步返回的真实 prompt_tokens(准, 免字符估算偏差);首步无前值→字符估算兜底(~2.5字符/token)。
-                    # 阈值 51000 = 60k 工作区×85%(留足余量:51k+输出6144=57k<65536 防崩)→ 提前转 planner 归纳压缩。
+                    # 上下文压力:优先用 mlx 上一步返回的真实 prompt_tokens(准, 免字符估算偏差);
+                    # 首步无前值→字符估算兜底(~2.5字符/token)。
                     approx = self.client.last_prompt_tokens or (sum(len(m.get("content", "")) for m in messages) * 2 // 5)
-                    if approx >= 51000:
+                    if approx >= L3_TOKEN_THRESHOLD:
+                        # 先 L3 原地压缩续跑(Codex mid-turn compact:任务不中断),
+                        # 压满 MAX_L3_COMPACTS 次仍未解出才转 planner 换思路。
+                        if ctx._compact_n < MAX_L3_COMPACTS:
+                            summary = self._build_handoff(ctx)
+                            if summary:
+                                ctx.compact_history(summary)
+                                self._log("l3_compact", step=step, approx_tokens=approx,
+                                          n=ctx._compact_n)
+                                # 压缩后重置 token 基线(Codex BodyAfterPrefix):否则固定前缀
+                                # 反复计入同一压缩窗口的预算,刚压完又立刻触发
+                                self.client.last_prompt_tokens = None
+                                continue
                         self._log("context_limit_replan", step=step, approx_tokens=approx,
-                                  source=("real" if self.client.last_prompt_tokens else "estimate"))
-                        return self._fail(ctx, step, f"上下文~{approx}token(达60k×85%),提前转 planner 归纳压缩关键代码段")
+                                  source=("real" if self.client.last_prompt_tokens else "estimate"),
+                                  compacted=ctx._compact_n)
+                        return self._fail(ctx, step,
+                                          f"上下文~{approx}token 且已压缩{ctx._compact_n}次,"
+                                          f"转 planner 归纳压缩关键代码段")
                     # max_tokens=6144:给足输出空间,不再截断模型的推理/公式转录/解题脚本(§不裁剪原则)。
                     # 靠 prompt 引导"务实简洁专注直接"来控冗长,而非硬砍 max_tokens(硬砍会连 ACTION/公式一起截没)。
                     resp = self.client.complete_tools(messages, max_tokens=6144, timeout=300, retries=2)

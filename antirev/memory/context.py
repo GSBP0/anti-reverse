@@ -247,6 +247,38 @@ class ContextManager:
         r["reason"] = reason
         return r
 
+    def known_evidence(self) -> set:
+        """台账里真实出现过的证据标识(地址 / artifact#N),供 L3 校验 confirmed[].evidence。
+
+        这些是**工具真实产出**的,不是模型自述 —— 交叉校验的锚点。有了它,摘要里的
+        地址/长度就不能凭记忆写(5985:同一段密文长度被五轮 summary 写成 32B→20B→25B)。
+        """
+        ev = set()
+        for v in self.ledger.reads.values():
+            if v.get("addr"):
+                ev.add(str(v["addr"]))
+        for key, v in self.ledger.func_map.items():
+            ev.add(str(key))
+            for r in (v.get("refs") or []):
+                ev.add(str(r))
+        for a in self.store.list_artifacts(self.run_id):
+            ev.add(f"artifact#{a['id']}")
+        return ev
+
+    def compact_history(self, summary_text: str) -> None:
+        """L3:把 append-only 历史整体替换为一条交接摘要。
+
+        Codex 的形态要求:摘要必须落在历史**最末**(模型是按这个形态训练的)。且摘要
+        **不孤军作战** —— 台账/facts/用户提示照旧由动态尾区承载,它们是工具产出的
+        结构化真实证据,比 LLM 改写过的摘要可信。
+        被替换掉的原始往返不丢:全文早已在 SQLite,可 recall 分页取回。
+        """
+        self._compact_n += 1
+        self.exchanges = [{"thought": None, "tool": None, "args": {},
+                           "obs": summary_text, "cid": None, "art_id": None,
+                           "summary": True}]
+        self._call_seq = 0
+
     # —— 动态尾区:唯一每步变化的段落 ——
     def dynamic_tail(self) -> str:
         """放在 messages 最末的动态区。顺序 = 优先级。
