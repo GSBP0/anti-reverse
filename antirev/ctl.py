@@ -64,3 +64,37 @@ def write_state(run_id: str, state: str, pid: int | None = None) -> None:
         if old:
             rec["pid"] = old
     p.write_text(json.dumps(rec))
+
+
+def checkpoint(run_id: str, progress: dict | None = None, logger=None) -> float:
+    """控制检查点。返回被暂停的秒数(未暂停返回 0.0)。
+
+    - `stopping` → 抛 StopRequested(穿过 except Exception 直达 finally 清理)
+    - `paused`   → 原地轮询等待;恢复时**直接修正 progress 里的时间基准**
+
+    调用方需自行把返回值加到自己的局部时间基准上(局部变量无法从函数外修改),
+    典型用法: `start += ctl.checkpoint(run_id, progress, logger)`
+    """
+    st = read_state(run_id)
+    if st == "stopping":
+        raise StopRequested(f"run {run_id} 被人工停止")
+    if st != "paused":
+        return 0.0
+    t0 = time.time()
+    if logger:
+        logger.event("paused", run_id=run_id)
+    while True:
+        st = read_state(run_id)
+        if st == "stopping":
+            raise StopRequested(f"run {run_id} 在暂停中被停止")
+        if st != "paused":
+            break
+        time.sleep(POLL_INTERVAL)
+    paused = time.time() - t0
+    if progress is not None:
+        progress["last"] = time.time()               # 暂停不算"无进展",重置 stuck 计时
+        if progress.get("deadline"):
+            progress["deadline"] += paused           # 全局时间预算顺延
+    if logger:
+        logger.event("resumed", run_id=run_id, paused_s=round(paused, 1))
+    return paused
