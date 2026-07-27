@@ -389,7 +389,16 @@ function connect(runId, { replay = false } = {}) {
   });
   es.addEventListener("end", (e) => {
     const d = JSON.parse(e.data);
-    addAlert("run 结束:" + JSON.stringify(d.result || {}).slice(0, 120), false);
+    const r = d.result || {};
+    // status=stopped 只有两种来源:你点了停止,或者外部给进程发了 SIGTERM。后者最常见的
+    // 肇事者是 `pkill -f antirev.solve_one`(eval 切轮次时清场,不区分 run_id)——
+    // 不点明的话会被误判成"平台把题跑挂了"。
+    if (r.status === "stopped" && !S.userStopped) {
+      addAlert("⚠ 被外部信号终止(不是你点的停止)。查一下有没有 pkill -f antirev.solve_one"
+               + " —— eval 切轮次时会用它清场,连带杀掉本平台的 run");
+    } else {
+      addAlert("run 结束:" + JSON.stringify(r).slice(0, 120), false);
+    }
     es.close();
   });
   es.onerror = () => { /* EventSource 自己带 Last-Event-ID 重连,不必手动处理 */ };
@@ -481,7 +490,7 @@ function showLaunch() {
 function resetState() {
   S.step = 0; S.round = 0; S.startedAt = null; S.pending = null; S.lastPrefill = null;
   S.maxSteps = null; S.agentPaused = false; S.memWarned = false;
-  S.sawStep = false; S.llmCalls = 0;
+  S.sawStep = false; S.llmCalls = 0; S.userStopped = false;
   S.funcs.clear(); S.reads.clear(); S.verified.clear(); S.alerts = [];
   $("history-list").innerHTML = "";
   $("focus").innerHTML = '<div class="label">等待 planner 产出 Plan…</div>';
@@ -497,6 +506,7 @@ function resetState() {
 // ——— 控制 ———
 async function control(action) {
   if (action === "stop" && !confirm("确定停止这道题?已跑出的日志会保留。")) return;
+  if (action === "stop") S.userStopped = true;   // 用来区分"我停的"和"被外部 SIGTERM 杀的"
   const r = await fetch(`/api/runs/${S.runId}/control`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action }),
