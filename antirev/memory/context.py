@@ -196,7 +196,11 @@ class ContextManager:
                     "_truncated": f"共{obs.get('count')}个函数,只列{len(shown)}(优先具名)。"
                                   f"缩小:ida_list_functions(filter=子串)/find_key_functions 打分/recall 取全表"}
         if tool == "find_key_functions":
-            return {"count": obs.get("count"), "functions": obs.get("functions", [])}
+            v = {"count": obs.get("count"), "functions": obs.get("functions", [])}
+            for k in ("total", "note"):      # 保留"全库总数/还有更多"提示,别在压缩视图里丢掉
+                if obs.get(k):
+                    v[k] = obs[k]
+            return v
         if tool == "run_python":
             return {"returncode": obs.get("returncode"),
                     "stdout": obs.get("stdout") or "",
@@ -333,7 +337,11 @@ class ContextManager:
         todo = render_todo(self.plan_steps, self._tools_used())
         if todo:
             lines.append("")
-            lines.append(todo)      # 最末:近因效应峰值(Manus 注意力锚定)
+            lines.append(todo)      # 近因效应峰值(Manus 注意力锚定)
+        # 台账/TODO 是 user 文字块,放在消息最末会让模型"对话式"回文字而不调工具
+        # (实测重构后 29% 的步只写正文空转)。故末行必须把它拽回工具调用。
+        lines.append("")
+        lines.append("**现在直接调用一个工具推进上面这一步**(一步一个;别只在正文里复述分析)。")
         return "\n".join(lines)
 
     # —— 供 planner 侧(ledger_text)与既有调用点复用 ——
@@ -372,6 +380,11 @@ class ContextManager:
                 asst["content"] = thought
             msgs.append(asst)
             msgs.append({"role": "tool", "tool_call_id": cid, "content": obs})
+        # 台账/TODO 必须**另起一条 user 消息**放在最末,不能并进上一条 tool 结果:
+        # 并进去的话,该 tool 消息下一步不再是最末、渲染时不带台账 → 同一条消息前后两步字节不同
+        # → 前缀从那里起每步失效(缓存全废)。另起一条则前面所有消息逐字节不变,只追加。
+        # 代价是末条为 user 文字块时模型易"对话式"回文字 —— 由 dynamic_tail 末行硬指令
+        # + executor 的 tool_choice=required 强制兜底(见 react_executor 的 force_tool)。
         msgs.append({"role": "user", "content": self.dynamic_tail()})
         return msgs
 

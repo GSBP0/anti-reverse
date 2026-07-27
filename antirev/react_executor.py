@@ -111,6 +111,15 @@ L3_TOKEN_THRESHOLD = 45000
 # 每步压会让改动点逐步前移、其后最近几步的全文跟着失效,40 步稳态命中率从 78.8% 崩到 28.4%,
 # 完全抵消 append-only 的收益。L1 的价值是"延缓 L3",不是持续瘦身,所以只在快撞阈值时出手。
 L1_TOKEN_THRESHOLD = 32000
+# L1 还有一条**条数**触发线:token 到 32k 前,历史往返早就堆到十几轮了。
+# 实测重构后上下文从"固定 10 条"涨到"最多 31 条",旧的失败尝试(报错脚本/UcError)全留在眼前
+# → 注意力稀释 + 照着错路重蹈覆辙,空转率 1%→26%。
+# 批量压(超 L1_MAX_EXCHANGES 就压到只剩 L1_KEEP_RECENT 轮全文)而非每步压:
+# 每步压会让缓存改动点每步前移、把其后几步全文也作废;批量压 ~8 步才动一次前缀。
+L1_MAX_EXCHANGES = 8      # 攒到 8 轮往返先压一次
+L1_KEEP_RECENT = 4        # 压完保留最近 4 轮全文
+L1_BATCH = 6              # 压过之后要再涨 6 轮才压下一批(滞后):
+                          # 否则超阈值后每步都会压掉新滑出的那条 → 前缀每步变、缓存持续失效
 
 
 def _is_progress(tool, obs) -> bool:
@@ -438,8 +447,15 @@ class ReactExecutor:
                         "functions": [{"addr": hex(f["addr"]), "name": f["name"],
                                        "size": f["size"]} for f in fns]}
             if tool == "find_key_functions":
-                fns = self._get_ida().score_functions(int(args.get("top", 12)))
-                return {"count": len(fns), "functions": fns}
+                r = self._get_ida().score_functions(int(args.get("top", 12)))
+                if isinstance(r, dict):     # 新格式:带全库总数,免模型误以为"函数就这些"
+                    out = {"count": r.get("shown"), "total": r.get("total"),
+                           "functions": r.get("functions", [])}
+                    if (r.get("total") or 0) > (r.get("shown") or 0):
+                        out["note"] = (f"全库共 {r['total']} 个函数,这里只按分数列前 {r['shown']} 个;"
+                                       f"高分里没有目标就调大 top 或 ida_list_functions(filter=..) 另找")
+                    return out
+                return {"count": len(r), "functions": r}      # 兼容旧格式
             if tool == "ida_decompile":
                 try:
                     r = self._get_ida().decompile(args["name_or_addr"])
@@ -570,7 +586,9 @@ class ReactExecutor:
         self._ctx = ctx               # 供 drop_history 用
         ctx.set_goal(plan)
         ctx.set_plan_steps(self.plan_steps)
-        bad_parse = 0                 # 连续无法解析(常因输出超 max_tokens 被截断成半截 JSON)计数
+        bad_parse = 0                 # 连续"没调工具"计数(达阈值转 planner,别把整轮步数耗在复读上)
+        force_tool = False            # 上一步只写正文没调工具 → 本步 API 层强制 tool_choice=required
+        l1_next = L1_MAX_EXCHANGES    # 下次触发 L1 的往返数(压一次后 +L1_BATCH,滞后免每步改前缀)
         seen_kb = set()               # 已注入过的知识库条目(每题每条只即时注一次,免刷屏)
         ctx.load_prior(store)         # 跨轮记忆:从 store 重建本题此前所有轮次的工具调用台账
         start = time.time()
@@ -611,10 +629,14 @@ class ReactExecutor:
                     approx = self.client.last_prompt_tokens or (sum(len(m.get("content", "")) for m in messages) * 2 // 5)
                     # L1 **按需**:接近阈值才压一次(零 LLM 成本,旧工具全文 → artifact 引用)。
                     # 不每步压 —— 那会让改动点每步前移、把其后最近几步的全文也作废。
-                    if approx >= L1_TOKEN_THRESHOLD:
-                        freed = ctx.micro_compact()
+                    over_cnt = len(ctx.exchanges) >= l1_next
+                    if approx >= L1_TOKEN_THRESHOLD or over_cnt:
+                        freed = ctx.micro_compact(protect=L1_KEEP_RECENT if over_cnt else None)
                         if freed:
-                            self._log("l1_compact", step=step, freed=freed, before_tokens=approx)
+                            l1_next = len(ctx.exchanges) + L1_BATCH   # 滞后:下批再压
+                            self._log("l1_compact", step=step, freed=freed, before_tokens=approx,
+                                      by=("count" if over_cnt else "tokens"),
+                                      exchanges=len(ctx.exchanges))
                             messages = ctx.build_messages(SYSTEM_PROMPT, plan)
                             # 压过之后真实 prompt_tokens 已过时(偏大),改用字符估算
                             approx = sum(len(m.get("content", "")) for m in messages) * 2 // 5
@@ -639,8 +661,12 @@ class ReactExecutor:
                                           f"转 planner 归纳压缩关键代码段")
                     # max_tokens=6144:给足输出空间,不再截断模型的推理/公式转录/解题脚本(§不裁剪原则)。
                     # 靠 prompt 引导"务实简洁专注直接"来控冗长,而非硬砍 max_tokens(硬砍会连 ACTION/公式一起截没)。
+                    # force_tool:上一步只写正文没调工具 → 这步在 API 层强制它必须调
+                    # (光靠 prompt 说"每步都要调工具"这个 35B 不听:实测复读能吃掉 29% 的步)
                     resp = self.client.complete_tools(messages, max_tokens=EXEC_MAX_TOKENS,
-                                                     timeout=300, retries=2)
+                                                     timeout=300, retries=2,
+                                                     tool_choice=("required" if force_tool else "auto"),
+                                                     think=(False if force_tool else None))
                     if resp is None:      # 模型调用重试后仍失败 → 跳过本步(不崩题)
                         continue
                     kind, tool, args, thought, flag = decode_native(resp)
@@ -672,6 +698,7 @@ class ReactExecutor:
                             continue                 # 跳过 _dispatch
                     if kind in ("action", "final"):
                         bad_parse = 0                 # 成功决策 → 清零无动作计数
+                        force_tool = False
                     if kind == "final":
                         # 反假阳性①:flag 必须在某工具输出里真实出现过(否则疑似编造)
                         inner = (flag[flag.find("{") + 1:flag.rfind("}")]
@@ -738,8 +765,12 @@ class ReactExecutor:
                                         "算法读懂了→run_python 写逆运算;构造型 flag(md5()/+)→自己按公式算各部分再拼。别再反编译更多函数。")
                         # 原生往返入窗口:thought=content, tool/args → 回放为 assistant.tool_calls + role:tool
                         ctx.push_exchange(thought, tool, args, obs_txt)
-                    else:   # kind == "none":模型没调任何工具 → 提示去调工具
+                    else:   # kind == "none":模型没调任何工具 → 下步 API 层强制,连续多次则转 planner
                         bad_parse += 1
+                        force_tool = True
+                        self._log("no_tool_call", step=step, n=bad_parse)
+                        if bad_parse >= 4:     # 强制也救不回来 = 卡死在复读,别把整轮步数耗光
+                            return self._fail(ctx, step, "连续多步只写正文不调工具(复读) → 转 planner 换思路")
                         hint = ("你上一步没有调用任何工具。请**直接调用相应工具**推进解题(别只在正文里空谈);"
                                 "确信拿到 flag 时调用 submit_flag 提交。")
                         ctx.push_exchange(thought, None, None, hint)
