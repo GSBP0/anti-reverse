@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 from antirev import config
-from antirev.isolation.subprocess_runner import run_isolated
+from antirev.isolation.subprocess_runner import clip_output, run_isolated
 
 
 _EMU_HELPER = (
@@ -46,8 +46,10 @@ def run_python(code: str, binary: str = None, timeout: int = None, workdir: str 
         cwd = workdir or str(config.PROJECT_ROOT)
         r = run_isolated([sys.executable, path],
                          timeout=timeout or config.TERMINAL_TIMEOUT * 2, cwd=cwd)
-        return {"returncode": r.returncode, "stdout": r.stdout,
-                "stderr": r.stderr, "timed_out": r.timed_out}
+        return {"returncode": r.returncode,
+                "stdout": clip_output(r.stdout, what="stdout"),
+                "stderr": clip_output(r.stderr, what="stderr"),
+                "timed_out": r.timed_out}
     finally:
         try:
             os.unlink(path)

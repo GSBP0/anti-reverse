@@ -31,3 +31,6 @@ grok-build/
 extracted_*/
 *_fixed.exe
 *.dump.exe
+
+# superpowers brainstorm 产物(mockup 缓存)
+.superpowers/

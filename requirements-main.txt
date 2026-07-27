@@ -16,3 +16,7 @@ pwntools==4.15.0
 pydantic==2.13.4
 requests==2.34.2
 pytest==9.1.1
+
+# Web 作战台(antirev/web):本机单人可视化控制台
+fastapi==0.140.1
+uvicorn==0.51.0

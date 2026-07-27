@@ -7,7 +7,7 @@ pyinstxtractor-ng(解 PyInstaller)、upx、binwalk、objdump/nm/readelf、string
 from __future__ import annotations
 
 from antirev import config
-from antirev.isolation.subprocess_runner import run_isolated
+from antirev.isolation.subprocess_runner import clip_output, run_isolated
 
 
 def terminal(command: str, workdir=None, timeout=None) -> dict:
@@ -24,7 +24,7 @@ def terminal(command: str, workdir=None, timeout=None) -> dict:
     )
     return {
         "returncode": r.returncode,
-        "stdout": r.stdout,
-        "stderr": r.stderr,
+        "stdout": clip_output(r.stdout, what="stdout"),
+        "stderr": clip_output(r.stderr, what="stderr"),
         "timed_out": r.timed_out,
     }

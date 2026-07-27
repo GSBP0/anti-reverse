@@ -187,3 +187,99 @@ def parse_tool_args(message: dict, name: str) -> dict:
         return {}
     except Exception:
         return {}
+
+
+# ============================ L3 上下文压缩:交接摘要 ============================
+# Codex 的关键取舍:压缩 prompt 要写成"任务交接"(handoff)而不是"内容概括"。
+# 明确告诉模型 progress / decisions / remaining work / critical references 四件事,
+# 远比"请总结一下"有效。字段按**五类 compact 失败模式**一一对应:
+#   约束丢失     → must_keep_verbatim(原文,禁改写)
+#   精确证据丢失 → confirmed[].evidence(artifact#N / 真实地址)
+#   失败方案污染 → failed_attempts(独立字段,渲染时标成"已排除"而非结论)
+#   目标漂移     → current_goal + confirmed/hypothesis 严格分离
+# 另一条铁律:摘要**不孤军作战** —— L3 后台账/facts/用户提示原文照旧由动态尾区承载。
+HANDOFF = _fn(
+    "context_handoff",
+    "上下文将被压缩。写一份**交接摘要**给接着干这道题的下一段会话(不是内容概括):"
+    "当前目标、必须原样保留的约束、已确认事实(每条给出证据地址/artifact)、仅是猜测的、"
+    "已试过并失败的、下一步动作。已失败的必须写进 failed_attempts,别写成结论。",
+    {
+        "current_goal": {**_STR, "description": "当前仍在推进的目标(别写已结束的旧目标)"},
+        "must_keep_verbatim": {**_STRARR, "description":
+                               "必须原样保留的约束:用户提示原文、题面给定的 name/email/明文、flag 格式要求"},
+        "confirmed": _objarr(
+            {"fact": {**_STR, "description": "已验证的事实(算法/长度/密钥…)"},
+             "evidence": {**_STR, "description": "证据位置:真实地址 0x.. 或 artifact#N —— 必须能对上台账"}},
+            "已确认事实,每条必须带证据位置(数字/hex 不许凭记忆写)"),
+        "hypothesis": _objarr(
+            {"guess": {**_STR, "description": "尚未验证的猜测"},
+             "how_to_verify": {**_STR, "description": "怎么验证它"}},
+            "仅是猜测的(与 confirmed 严格分开,防下一轮把猜测当既定事实)"),
+        "failed_attempts": _objarr(
+            {"attempt": {**_STR, "description": "试过的解法"},
+             "why_failed": {**_STR, "description": "为何失败(乱码/超时/地址错…)"}},
+            "已试过并失败的 —— **标成已排除,别写成当前结论**"),
+        "next_actions": {**_STRARR, "description": "下一步具体动作(可直接执行,别空话)"},
+    },
+    ["current_goal", "next_actions"],
+)
+
+# 语义锚点:摘要开头固定这一句,人和模型都能一眼认出"这是交接摘要不是真实 user 消息"。
+# (Codex 还用它做 is_summary_message 判定以便下次压缩跳过旧摘要;antirev 不需要 ——
+#  摘要条目在 exchanges 里带 summary=True 标记,判定走标记不走文本匹配。)
+SUMMARY_PREFIX = "【上下文交接摘要】"
+
+
+def validate_handoff(d: dict, known_evidence: set | None = None) -> list:
+    """校验交接摘要。known_evidence 给出时,confirmed[].evidence 必须能在其中对上。
+
+    这条交叉校验是治 P0-4 的关键:5985 实测五轮 summary 把同一段密文长度从 32B 写成
+    20B 再写成 25B,planner 按错误长度规划 → replan 永不收敛。台账里的地址/artifact
+    是工具真实产出的,拿它当锚点,数字就漂不了。
+    """
+    d = d or {}
+    errs = []
+    if not str(d.get("current_goal") or "").strip():
+        errs.append("current_goal 为空")
+    if not [s for s in (d.get("next_actions") or []) if str(s).strip()]:
+        errs.append("next_actions 为空")
+    if known_evidence is not None:
+        for it in d.get("confirmed") or []:
+            ev = str((it or {}).get("evidence") or "").strip()
+            if ev and not any(k and k in ev for k in known_evidence):
+                errs.append(f"confirmed 的证据 {ev} 在台账里对不上(数字/地址不许凭记忆写,"
+                            f"请用台账里真实出现过的地址或 artifact#N)")
+    return errs
+
+
+def render_handoff(d: dict) -> str:
+    """交接摘要结构 → 文本。带 SUMMARY_PREFIX 锚点;失败项显式标"已排除"。"""
+    d = d or {}
+    lines = [SUMMARY_PREFIX, f"## 当前目标\n{str(d.get('current_goal') or '').strip()}"]
+    mk = [str(x).strip() for x in (d.get("must_keep_verbatim") or []) if str(x).strip()]
+    if mk:
+        lines.append("## 必须原样遵守的约束(原文,不得改写)")
+        lines.extend(f"- {x}" for x in mk)
+    cf = d.get("confirmed") or []
+    if cf:
+        lines.append("## 已确认事实(带证据位置,可直接采信)")
+        for it in cf:
+            it = it or {}
+            lines.append(f"- {it.get('fact', '')}  [证据: {it.get('evidence', '?')}]")
+    hy = d.get("hypothesis") or []
+    if hy:
+        lines.append("## 仅是猜测(**未验证,别当事实用**)")
+        for it in hy:
+            it = it or {}
+            lines.append(f"- {it.get('guess', '')} → 验证方式: {it.get('how_to_verify', '')}")
+    fa = d.get("failed_attempts") or []
+    if fa:
+        lines.append("## 已排除的解法(**试过且失败,别重走**)")
+        for it in fa:
+            it = it or {}
+            lines.append(f"- {it.get('attempt', '')} —— 失败原因: {it.get('why_failed', '')}")
+    na = [str(x).strip() for x in (d.get("next_actions") or []) if str(x).strip()]
+    if na:
+        lines.append("## 下一步动作")
+        lines.extend(f"{i}. {x}" for i, x in enumerate(na, 1))
+    return "\n".join(lines)

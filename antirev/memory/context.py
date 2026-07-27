@@ -1,16 +1,41 @@
-"""Executor 上下文管理(§6):Working Memory + 结构化持久台账 + 历史窗口 + 外部记忆引用。
+"""Executor 上下文编排:消息装配 + 事实 + 压缩触发。
 
-目标(§6 核心):让上下文**始终概括当前全部进度**,且远低于 64k。做法:
-- **结构化台账(ledger)**:每次工具调用的关键结果按类型沉淀(函数地图/已读字节/解题尝试/概况),
-  **永久常驻上下文**(不随窗口滑出),空间有界(每类去重+截断)。→ executor 牢记已知,不重复不空转。
-- 只保留最近 window 步的**原始观察全文**(近处细节);更早步由台账代表(远处只留骨架)。
-- 大观察(反编译等)全文进 SQLite(§6.3),上下文只留结构化提取 + artifact#id(可 recall)。
-- 台账可从 store 跨轮重建(load_prior)→ 下一轮 executor / planner 继承前几轮的全部发现。
-- 每步重建 messages = [system] + [task+台账(稳定前缀)] + [最近 window 步原始往返]。稳定前缀在前利于 KV 复用(§6.4)。
+目标:让上下文**始终概括当前全部进度**,且远低于 64k 工作区。布局(§6.4 缓存友好):
+
+    [system]                  角色+纪律+knowledge.checklist()   ← 全 run 静态
+    [user] task               题面+预分析+Plan                   ← 本轮静态
+    [assistant/tool] × N      工具往返,**append-only**           ← 入队即冻结
+    [user] dynamic_tail()     用户提示→事实→台账→TODO            ← 唯一每步变化段
+
+变化段放**最末**而非旧版的 msg[1]:mlx_lm.server 用 PromptTrie 做 common-prefix KV 复用
+(mlx_lm/models/cache.py:1674),append-only 让本次 prompt 恰为上次 prompt 的扩展 →
+命中 `shorter` 路径,只 prefill 增量且免 trim。近因注意力也偏爱尾部 —— 两者同向。
+
+分工:
+- 台账(`ledger.Ledger`):工具结果按类型增量沉淀,常驻、有界。ACE 式增删改,不让 LLM 整体重写。
+- 外部记忆(`store`):大观察全文进 SQLite,上下文只留结构化提取 + artifact#id(可 recall 分页)。
+- 压缩(`compact`):L1 每步把旧工具全文换 artifact 引用;L2 模型主动丢无关轮次;
+  L3 到阈值出交接摘要替换历史。全部遵守**决策冻结** —— 每处只改一次,此后字节不变。
+- 跨轮:`load_prior` 从 store 重建台账 → 下一轮 executor/planner 继承前几轮全部发现。
 """
 from __future__ import annotations
 import json
 import re
+
+# 折叠/分页/有界化已拆到 fold.py;此处再导出,保持既有导入路径可用
+# (tests/test_fold_paginate.py 与 react_executor 的 recall 分支都从 context 导入)。
+from antirev.memory.fold import (_ADDR_PREFIX, _clip_big, _fold_repeats,  # noqa: F401
+                                 _norm_line, paginate, recall_view)
+# 指纹/段图/签名渲染已拆到 render.py;同样再导出(tests/test_fingerprint.py 与
+# tests/test_outline_render.py 都从 context 导入)。
+from antirev.memory.render import (_addrs, _first_sig, _parse_addr,  # noqa: F401
+                                   render_fingerprint, render_outline, render_todo)
+# 台账(ACE 增量更新)已拆到 ledger.py。_FLAGISH_RE/_looks_secret 供本模块的 _harvest_facts 用。
+from antirev.memory.ledger import Ledger, _FLAGISH_RE, _looks_secret  # noqa: F401
+
+# 保留最近几次 run_python 的脚本全文。=1 时"上次错在哪、这次改了什么"的代码差就看不见了
+# (P0-5/5985:步11 ValueError 与步12 半截 flag 之间无法对比 → 同错重试)。=2 够诊断又不占太多。
+KEEP_PY_FULL = 2
 
 
 def _brief_args(args, cap=100) -> str:
@@ -23,193 +48,6 @@ def _brief_args(args, cap=100) -> str:
     return ", ".join(out)
 
 
-def _first_sig(pseudocode: str) -> str:
-    """取伪代码里第一行真正的函数签名(跳过 // 注释 / attributes 行)。"""
-    for ln in (pseudocode or "").splitlines():
-        s = ln.strip()
-        if s and not s.startswith("//") and not s.startswith("/*"):
-            return s
-    return (pseudocode or "").strip()
-
-
-def _addrs(items) -> list:
-    """从 callees/data_refs 列表提取地址(或名字)字符串。"""
-    out = []
-    for it in items or []:
-        if isinstance(it, dict):
-            out.append(str(it.get("addr") or it.get("name") or ""))
-        else:
-            out.append(str(it))
-    return [a for a in out if a]
-
-
-_ADDR_PREFIX = re.compile(r"^\s*0x[0-9a-fA-F]+\s+")
-
-# —— B3/B4:突破点(facts)与每步信息精华(insights)的抽取辅助 ——
-_FLAGISH_RE = re.compile(r"[A-Za-z0-9_]{2,}\{[^}]{2,}\}")
-_HEXCONST_RE = re.compile(r"\b0x[0-9a-fA-F]{2,}\b")
-_ESS_KW = re.compile(
-    r"(算法|密钥|密文|明文|偏移|delta|轮数|rounds?|s-?盒|码表|异或|xor|加密|解密|补码|大小端|字节序|"
-    r"输入长度|长度\s*[:：]?\s*\d|flag\s*格式|memcmp|strcmp|入口|entry|"
-    r"是\s*(?:标准|魔改)?\s*(tea|xtea|xxtea|rc4|aes|base64|md5|sha))", re.I)
-_SECRET_SZ = {8, 16, 24, 32, 40, 48, 56, 64}
-
-
-def _looks_secret(hexstr, size) -> bool:
-    """B3:疑似密文/密钥判据(纯离线)——非空、非全零、字节多样,或落常见密码块长。"""
-    if not hexstr or not size or size < 8:
-        return False
-    try:
-        b = bytes.fromhex(hexstr) if len(hexstr) % 2 == 0 else b""
-    except ValueError:
-        return False
-    if not b or set(b) == {0}:
-        return False
-    return size in _SECRET_SZ or len(set(b)) / len(b) >= 0.4
-
-
-def _essence_from_thought(thought: str) -> str:
-    """B4:从 thought 抽'新确认结论'一句(优先含关键词且带 hex/数值的句子,截 100)。"""
-    if not thought:
-        return ""
-    sents = re.split(r"[。\n;；.]", thought)
-    for s in sents:
-        s = s.strip()
-        if len(s) >= 4 and _ESS_KW.search(s) and (_HEXCONST_RE.search(s) or re.search(r"\d", s)):
-            return s[:100]
-    for s in sents:
-        s = s.strip()
-        if len(s) >= 6 and _ESS_KW.search(s):
-            return s[:100]
-    return ""
-
-
-def _norm_line(ln: str) -> str:
-    """折叠比较键:去掉反汇编行首地址前缀(0x401000  ...)后 strip,让'指令体相同、地址不同'的花指令行判为同类。"""
-    return _ADDR_PREFIX.sub("", ln).strip()
-
-
-def _fold_repeats(text: str, min_run: int = 3) -> str:
-    """内容感知折叠(治密度,非位置截断):连续 >=min_run 的同类行(归一化后相同)折成'代表行+计数',
-    不同的行全保留 —— 无损于信息(花指令的真实变换仍在),有损于冗余(几百重复 pass 压成两行)。
-    与旧 _clip_big 的区别:不按位置砍中间,大算法函数的主体不会被误删;超大兜底交给上层 + recall 分页。"""
-    lines = text.split("\n")
-    out, i, n = [], 0, len(lines)
-    while i < n:
-        key = _norm_line(lines[i])
-        j = i + 1
-        while j < n and _norm_line(lines[j]) == key:
-            j += 1
-        run = j - i
-        if key and run >= min_run:                     # 空行不折叠(避免压掉排版空白)
-            out.append(lines[i])                       # 保留一份代表样本(原文,含地址)
-            out.append(f"// ... [× {run} 行同类已折叠 {run - 1} 行;需逐行看用 recall 分页] ...")
-        else:
-            out.extend(lines[i:j])
-        i = j
-    return "\n".join(out)
-
-
-def paginate(text: str, page: int = 1, num: int = 120) -> dict:
-    """对(折叠后的)文本按页无损切分:每页 num 行,page 从 1。返回 total_pages/has_next,让模型知道还有没有下一页。
-    越界页返回空 text(不报错),空文本返回 0 行 —— 供 recall 逐页取全,替代'一次性回灌几十k全文'。"""
-    num = max(1, int(num))
-    page = max(1, int(page))
-    lines = text.split("\n") if text else []
-    total_lines = len(lines)
-    total_pages = (total_lines + num - 1) // num
-    start = (page - 1) * num
-    chunk = lines[start:start + num]
-    return {"page": page, "num": num, "total_lines": total_lines,
-            "total_pages": total_pages, "text": "\n".join(chunk),
-            "has_next": start + num < total_lines}
-
-
-def recall_view(full_text: str, page: int = 1, num: int = 120) -> dict:
-    """recall 的分页视图:从 artifact 全文提取可读代码(伪代码优先,其次反汇编),折叠冗余后按页返回。
-    非反编译类 artifact(无 pseudocode/disasm)回退为对全文分页 —— 一律无损、可逐页翻,替代一次性回灌几十k。"""
-    try:
-        obs = json.loads(full_text) if full_text else {}
-    except Exception:
-        obs = None
-    code = ""
-    if isinstance(obs, dict):
-        code = obs.get("pseudocode") or obs.get("disasm") or ""
-    return paginate(_fold_repeats(code or (full_text or "")), page, num)
-
-
-def render_fingerprint(feat: dict) -> str:
-    """把函数算法骨架(worker 从汇编抽取的 feat)渲染成一行高密度指纹,替代 func_map 的裸签名。
-    保留写 solve 所需的常量与结构:输入/循环次数/带立即数的运算(如 xor 0x37)/比较目标/调用/串引用;
-    全文仍可 recall 分页。一行 ~80 字符,却顶裸签名十倍信息量。"""
-    p = []
-    if feat.get("input"):
-        p.append("in")
-    if feat.get("loops"):
-        p.append(f"loop×{feat['loops']}")
-    ops = feat.get("ops") or []
-    if ops:     # 花指令题可有几百个不同立即数 → 只显示前 10,余标 …+N(防台账单行爆几千字符)
-        shown = ", ".join(m if imm is None else f"{m} {imm:#x}" for m, imm in ops[:10])
-        p.append("ops=[" + (shown + f", …+{len(ops) - 10}" if len(ops) > 10 else shown) + "]")
-    cmp_imms = feat.get("cmp_imms") or []
-    if cmp_imms:
-        shown = ", ".join(f"{v:#x}" for v in cmp_imms[:8])
-        p.append("cmp=[" + (shown + f", …+{len(cmp_imms) - 8}" if len(cmp_imms) > 8 else shown) + "]")
-    elif feat.get("cmps"):
-        p.append(f"cmp×{feat['cmps']}")
-    if feat.get("calls"):
-        p.append("calls=[" + ",".join(" ".join(str(c).split()) for c in feat["calls"]) + "]")
-    if feat.get("strs"):    # 折叠串内换行/空白(如 Correct\n),保证指纹单行
-        p.append("refs=[" + ",".join(" ".join(str(s).split()) for s in feat["strs"]) + "]")
-    return " ".join(p) if p else "(无显著特征)"
-
-
-def _parse_addr(x):
-    """把 name_or_addr 解析为 int 地址;非 0x 十六进制(如函数名)返回 None(覆盖追踪只认地址)。"""
-    try:
-        if isinstance(x, int):
-            return x
-        s = str(x).strip()
-        return int(s, 16) if s.lower().startswith("0x") else None
-    except Exception:
-        return None
-
-
-def render_outline(outline, seen=None) -> str:
-    """把函数 outline(分段地图)渲染成 AI/planner 可读的导航文本:每段特征 + ★核心段 + [已看]/[未看]。
-    seen=已下钻的 seg_id 集合(None=planner 侧无覆盖信息只显示地图;set() 空集=executor 侧全未看)。核心段优先展示。"""
-    if not outline or not outline.get("segments"):
-        return ""
-    segs = outline["segments"]
-    n = len(segs)
-    track = seen is not None        # None=无覆盖信息(planner); set()=有覆盖(空集也显示全未看)
-    seen = seen or set()
-    head = f"{outline.get('addr')} 分{n}段"
-    if track:
-        head += f", 已看{len(seen)}/{n}, 还有{n - len(seen)}段未下钻"
-    lines = [head + ":"]
-    for s in sorted(segs, key=lambda x: (not x.get("core"), x.get("id", 0))):
-        star = "★" if s.get("core") else " "
-        mark = ("[已看]" if s.get("id") in seen else "[未看]") if track else ""
-        fp = render_fingerprint(s.get("feat") or {})
-        lines.append(f"  [seg{s.get('id')}] {star}{s.get('kind')} "
-                     f"@{s.get('start')}-{s.get('end')} ({s.get('n_insn')}insn) {mark}  {fp}")
-    return "\n".join(lines)
-
-
-def _clip_big(s: str, limit: int = 8000) -> str:
-    """进上下文的默认视图有界化:先 _fold_repeats 折叠冗余(治密度),折叠后仍超 limit 才保头尾兜底(保证不撑爆 64k)。
-    与旧版差异:大算法函数先被折叠而非直接砍中间;真超大时兜底截断,但中间可用 recall 分页无损取回。"""
-    if not s:
-        return s
-    folded = _fold_repeats(s)
-    if len(folded) <= limit:
-        return folded
-    return (folded[:limit * 2 // 3] +
-            f"\n... [折叠后仍超长,省略中间 {len(folded) - limit} 字符;需全文用 recall(可 page/num 分页)] ...\n" +
-            folded[-limit // 3:])
-
-
 class ContextManager:
     def __init__(self, store, run_id, window=6, big_threshold=800):
         self.store = store
@@ -220,19 +58,67 @@ class ContextManager:
         self.facts = []          # 已确认关键事实(字符串)
         self.user_hints = []     # 人工干预(human-in-the-loop):用户中途丢的提示,最高优先级
         self.step_notes = []     # 每步一行压缩摘要(调试/兜底用)
-        self.exchanges = []      # [dict(thought,tool,args,obs,cid)] 原生 tool_calls 往返,只保留最近 window
+        self.exchanges = []      # [dict(thought,tool,args,obs,cid)] 原生 tool_calls 往返
         self._call_seq = 0       # 合成 tool_call_id 自增计数(回放需 assistant.tool_calls 与 role:tool 配对)
-        # —— 结构化持久台账(§6:常驻上下文,空间有界)——
-        self.func_map = {}       # 反编译函数地图: key(name_or_addr) → {sig, calls[], refs[], step}
-        self.reads = {}          # 已读字节: key(addr:size) → {addr, size, head, step}
-        self.attempts = []       # 解题尝试(时序): {step, tool, digest}
-        self.scans = {}          # 概况(最新覆盖): analyze/list_functions/floss/unpack → 一行摘要
-        self.func_outlines = {}  # 大函数分段地图: key(name_or_addr) → {outline, seen:set(已下钻 seg_id)}
-        self.insights = []       # B4:每步信息精华(推理结论/中间值),窗口外持久、本轮有界 40
+        self.ledger = Ledger()   # 结构化持久台账(ACE 增量更新,常驻上下文、空间有界)
+        self._last_art_id = None  # 上一次 record 的 artifact id(供 push_exchange 关联,L1 靠它换引用)
+        self._compact_n = 0      # L3 已压缩次数(达 MAX_L3_COMPACTS 转 planner)
+        self.plan_steps = []     # 结构化 Plan 步骤(emit_plan 产物),供 TODO 复述
+
+    # —— 台账字段代理:保持 ctx.func_map / ctx.attempts 等既有访问路径可用
+    # (react_executor 的台账快照与 _break_hint、以及多处测试都直接读这些名字)——
+    @property
+    def func_map(self):
+        return self.ledger.func_map
+
+    @property
+    def reads(self):
+        return self.ledger.reads
+
+    @property
+    def attempts(self):
+        return self.ledger.attempts
+
+    @property
+    def scans(self):
+        return self.ledger.scans
+
+    @property
+    def func_outlines(self):
+        return self.ledger.func_outlines
+
+    @property
+    def insights(self):
+        return self.ledger.insights
+
+    def ledger_block(self) -> str:
+        return self.ledger.render()
+
+    def _brief(self, tool, obs) -> str:
+        return self.ledger.brief(tool, obs)
 
     # —— 事实/目标 ——
     def set_goal(self, goal):
         self.goal = goal
+
+    def set_plan_steps(self, steps) -> None:
+        """接收结构化 Plan 步骤(emit_plan 的 steps 字段),用于尾部 TODO 复述。"""
+        self.plan_steps = list(steps or [])
+
+    def _tools_used(self) -> set:
+        """已实际调用过的工具名(据台账 + 往返;TODO 勾选判定用,纯规则、不花 LLM)。"""
+        used = {a["tool"] for a in self.ledger.attempts if a.get("tool")}
+        used |= {ex["tool"] for ex in self.exchanges if ex.get("tool")}
+        # 台账的 scans/func_map/reads 也是"某工具跑过"的证据(attempts 只记解题类工具)
+        for key, tool in (("analyze", "analyze"), ("functions", "ida_list_functions"),
+                          ("key_functions", "find_key_functions"), ("floss", "floss")):
+            if key in self.ledger.scans:
+                used.add(tool)
+        if self.ledger.func_map:
+            used.add("ida_decompile")
+        if self.ledger.reads:
+            used.add("ida_read_bytes")
+        return used
 
     def add_fact(self, fact):
         if fact and fact not in self.facts:
@@ -249,20 +135,21 @@ class ContextManager:
         brief = self._brief(tool, obs)
         # 总是存 artifact:既作工具缓存(避免重复 IDA 分析),又可 recall 重看全文、跨轮重建台账
         art_id = self.store.put_artifact(self.run_id, tool, args, brief, full)
-        self._ledger_add(step, tool, args, obs)          # ← 关键:沉淀进结构化台账
+        self.ledger.add(step, tool, args, obs)           # ← 关键:沉淀进结构化台账
         self._harvest(step, tool, args, obs, thought)    # B3/B4:强确认→facts,一般增量→insights
         ctx_view = self._context_view(tool, obs)
         if len(full) > self.big_threshold and isinstance(ctx_view, dict):
             ctx_view["_artifact_id"] = art_id
             ctx_view["_hint"] = f"全文已存 artifact#{art_id},需要重看用 recall"
+        self._last_art_id = art_id      # 供 push_exchange 关联(L1 要靠它把旧全文换成 recall 引用)
         note = f"步{step}: {tool}({_brief_args(args)}) → {brief} [artifact#{art_id}]"
         self.step_notes.append(note)
         return f"OBSERVATION: {json.dumps(ctx_view, ensure_ascii=False)}"
 
     # —— B3/B4 信息萃取汇聚点:强确认→facts(跨轮落库),一般增量→insights(本轮持久)——
     def _harvest(self, step, tool, args, obs, thought):
-        self._harvest_facts(step, tool, args, obs)
-        self.add_insight(step, tool, args, obs, thought)
+        self._harvest_facts(step, tool, args, obs)           # 强确认 → facts(跨轮落库)
+        self.ledger.add_insight(step, tool, obs, thought)    # 一般增量 → insights(本轮持久)
 
     def _harvest_facts(self, step, tool, args, obs):
         """B3:只收改变解题状态、跨轮仍成立的强确认(定位分支/求得输入/自验/密文密钥/flag候选)。"""
@@ -285,112 +172,6 @@ class ContextManager:
                 f = f"run_python 产出 flag 候选: {m.group()}"
         if f:
             self.add_fact(f)     # 已有:去重 + store.put_fact 落库
-
-    def add_insight(self, step, tool, args, obs, thought):
-        """B4:抽'一般增量'——thought 新结论 + run_python 非flag中间值(flag 归 facts)。"""
-        bits = []
-        th = _essence_from_thought(thought)
-        if th:
-            bits.append(th)
-        if tool == "run_python" and isinstance(obs, dict) and not obs.get("error"):
-            out = (obs.get("stdout") or "").strip()
-            if out and not _FLAGISH_RE.search(out):
-                first = next((l for l in out.splitlines() if l.strip()), "")
-                if first:
-                    bits.append("py→" + first[:80])
-        text = "; ".join(bits)[:160]
-        if not text or any(it["text"] == text for it in self.insights[-6:]):
-            return
-        self.insights.append({"step": step, "text": text})
-        if len(self.insights) > 40:
-            self.insights = self.insights[-40:]
-
-    # —— 结构化台账:把一次工具调用的关键结果按类型沉淀(去重)——
-    def _ledger_add(self, step, tool, args, obs):
-        if not isinstance(obs, dict):
-            if tool in ("run_python", "terminal"):
-                self.attempts.append({"step": step, "tool": tool, "digest": str(obs)})
-            return
-        if obs.get("error"):
-            # 失败也要记(避免重复踩同一坑),归到尝试/概况
-            self.attempts.append({"step": step, "tool": tool, "digest": f"错误 {str(obs['error'])}"})
-            return
-        if tool in ("ida_decompile", "ida_disasm"):
-            key = str(args.get("name_or_addr", f"#{step}")).lower()
-            pc = obs.get("pseudocode")
-            if pc:
-                sig = _first_sig(pc)
-            elif obs.get("disasm"):     # 反汇编兜底(hexrays失败或直接disasm)
-                first = obs["disasm"].splitlines()[0] if obs["disasm"] else ""
-                sig = "[反汇编] " + first[:60]
-            else:
-                sig = ""
-            feat = obs.get("fingerprint_feat")
-            fp = render_fingerprint(feat) if feat else ""
-            self.func_map[key] = {"sig": sig, "fp": fp, "calls": _addrs(obs.get("callees")),
-                                  "refs": _addrs(obs.get("data_refs")), "step": step}
-            outline = obs.get("outline")
-            if outline:     # 大函数分段地图入台账(常驻;record 已把 obs 存 artifact → 跨轮 load_prior 免费重建)
-                self.func_outlines.setdefault(key, {"outline": None, "seen": set()})["outline"] = outline
-            if tool == "ida_disasm":     # 局部下钻 → 命中段标已看(覆盖追踪)
-                addr = _parse_addr(args.get("name_or_addr"))
-                if addr is not None:
-                    for e in self.func_outlines.values():
-                        for seg in (e["outline"] or {}).get("segments", []):
-                            if int(seg["start"], 16) <= addr < int(seg["end"], 16):
-                                e["seen"].add(seg["id"])
-        elif tool == "ida_read_bytes":
-            disp = str(args.get("name_or_addr", obs.get("addr")))
-            key = f"{disp}:{obs.get('size')}"
-            self.reads[key] = {"addr": disp, "size": obs.get("size"),
-                               "head": obs.get("hex") or "", "step": step}
-        elif tool == "analyze":
-            fi = obs.get("file_info", {}) or {}
-            pk = obs.get("packer", {}) or {}
-            self.scans["analyze"] = (f"{fi.get('format')} {fi.get('arch')} {fi.get('bits')}bit "
-                                     f"imports={fi.get('num_imports')} size={fi.get('size')} "
-                                     f"packed={pk.get('packed_likely')}")
-        elif tool == "ida_list_functions":
-            self.scans["functions"] = f"{obs.get('count')} 个函数(filter={args.get('filter','')!r})"
-        elif tool == "find_key_functions":
-            fns = obs.get("functions", [])
-            top = "; ".join(f"{f.get('addr')}(score{f.get('score')}:{','.join(f.get('why', []))})"
-                            for f in fns)
-            self.scans["key_functions"] = f"关键函数排序 → {top}"
-        elif tool == "floss":
-            out = (obs.get("output") or "").replace("\n", " ")
-            self.scans["floss"] = f"字符串: {out[:160]}"
-        elif tool in ("run_python", "solve_angr", "solve_verify", "solve_locate", "unicorn_emulate"):
-            self.attempts.append({"step": step, "tool": tool, "digest": self._brief(tool, obs)})
-
-    def _brief(self, tool, obs) -> str:
-        if not isinstance(obs, dict):
-            return str(obs)
-        if obs.get("error"):
-            return f"错误: {str(obs['error'])}"
-        if tool in ("ida_decompile", "ida_disasm"):
-            if obs.get("pseudocode"):
-                return f"反编译: {_first_sig(obs['pseudocode'])}; callees={len(obs.get('callees',[]))} data_refs={len(obs.get('data_refs',[]))}"
-            if obs.get("disasm"):
-                return f"反汇编({(obs.get('disasm') or '').count(chr(10))+1}行); callees={len(obs.get('callees',[]))}"
-            return "无输出"
-        if tool == "ida_read_bytes":
-            return f"{obs.get('size')}字节 @ {obs.get('addr')}: {obs.get('hex','')}"
-        if tool == "ida_list_functions":
-            return f"{obs.get('count')} 个函数"
-        if tool == "find_key_functions":
-            fns = obs.get("functions", [])
-            return f"{len(fns)}候选,top: " + ", ".join(f"{f.get('addr')}(score{f.get('score')})" for f in fns)
-        if tool == "run_python":
-            out = (obs.get("stdout") or "").strip().replace("\n", " ")
-            return f"rc={obs.get('returncode')} stdout={out}" + (" [有stderr]" if obs.get("stderr") else "")
-        if tool == "solve_locate":
-            return f"find={obs.get('find')} avoid={obs.get('avoid')}"
-        if tool == "solve_angr":
-            return f"found={obs.get('found')} stdin={str(obs.get('stdin',''))}"
-        if tool == "solve_verify":
-            return f"accepted={obs.get('accepted')} ({obs.get('method')})"
-        return json.dumps(obs, ensure_ascii=False)
 
     def _context_view(self, tool, obs) -> dict:
         """放进上下文的观察视图:完整保留工具结果全文(§不裁剪原则)——模型据全文决策,不再截断任何反编译/反汇编/输出。"""
@@ -431,45 +212,13 @@ class ContextManager:
                 obs = json.loads(a["full_text"]) if a["full_text"] else {}
             except Exception:
                 continue
-            self._ledger_add(a["id"], a["tool"], a["args"], obs)
+            self.ledger.add(a["id"], a["tool"], a["args"], obs)
             n += 1
         for fr in store.get_facts(self.run_id):          # B3:重建强确认 facts(即便上轮 summary 空/崩,线索仍结转)
             v = fr.get("value") if isinstance(fr, dict) else str(fr)
             if v and v not in self.facts:
                 self.facts.append(v)                      # append(不再 put_fact,免重复写库)
         return n
-
-    # —— 台账渲染(常驻上下文;每类去重+截断,空间有界)——
-    def ledger_block(self) -> str:
-        lines = ["## 已知台账(所有工具调用结果的持久记录 —— 查过的别重复查,据此决定下一步)"]
-        if self.scans:
-            for k in ("analyze", "unpack", "functions", "key_functions", "floss"):
-                if k in self.scans:
-                    lines.append(f"- {k}: {self.scans[k]}")
-        if self.func_map:
-            lines.append(f"- 已反编译函数({len(self.func_map)}个, addr → 签名 | 算法指纹 | calls | refs):")
-            for key, v in self.func_map.items():
-                calls = ",".join(v["calls"]) if v["calls"] else "-"
-                refs = ",".join(v["refs"]) if v["refs"] else "-"
-                fp = v.get("fp") or "-"
-                lines.append(f"   {key} {v['sig']} | {fp} | calls {calls} | refs {refs}")
-        if self.func_outlines:
-            lines.append("- 大函数分段导航(★核心段;下钻 ida_disasm(段start, end=段end);逐段理解防遗漏):")
-            for e in self.func_outlines.values():
-                lines.append("  " + render_outline(e["outline"], e["seen"]).replace("\n", "\n  "))
-        if self.reads:
-            lines.append("- 已读字节:")
-            for v in self.reads.values():
-                lines.append(f"   {v['addr']} ({v['size']}B) {v['head']}")
-        if self.attempts:
-            lines.append("- 解题尝试(时序):")
-            for a in self.attempts:
-                lines.append(f"   步{a['step']} {a['tool']} → {a['digest']}")
-        if self.insights:     # B4:每步信息精华,窗口滑出后仍留,防重复推导
-            lines.append("- 每步关键增量(推理结论/中间值,窗口外仍留;别重复推导):")
-            for it in self.insights[-20:]:
-                lines.append(f"   步{it['step']}: {it['text']}")
-        return "\n".join(lines)
 
     def ledger_text(self) -> str:
         """供跨轮回传 planner。facts 置顶(planner 现在完全看不到 facts,此处补上)。"""
@@ -514,8 +263,62 @@ class ContextManager:
             used += len(chunk)
         return "\n\n".join(parts)
 
-    # —— Working Memory 渲染(§6.1):目标 + 事实 + 结构化台账 ——
-    def working_memory_block(self) -> str:
+    # —— 渐进式压缩入口(L1/L2;L3 见 compact_history)——
+    def micro_compact(self, protect=None) -> int:
+        """L1:把超出保护窗的旧工具结果换成 artifact 引用(零 LLM 成本、可 recall 取回)。"""
+        from antirev.memory.compact import PROTECT_RECENT_STEPS, micro_compact
+        return micro_compact(self.exchanges,
+                             PROTECT_RECENT_STEPS if protect is None else protect)
+
+    def drop_history(self, steps, reason="") -> dict:
+        """L2:模型主动丢弃与当前任务无关的历史轮次(零 LLM 成本)。"""
+        from antirev.memory.compact import PROTECT_RECENT_STEPS, drop_steps
+        r = drop_steps(self.exchanges, steps, PROTECT_RECENT_STEPS)
+        r["reason"] = reason
+        return r
+
+    def known_evidence(self) -> set:
+        """台账里真实出现过的证据标识(地址 / artifact#N),供 L3 校验 confirmed[].evidence。
+
+        这些是**工具真实产出**的,不是模型自述 —— 交叉校验的锚点。有了它,摘要里的
+        地址/长度就不能凭记忆写(5985:同一段密文长度被五轮 summary 写成 32B→20B→25B)。
+        """
+        ev = set()
+        for v in self.ledger.reads.values():
+            if v.get("addr"):
+                ev.add(str(v["addr"]))
+        for key, v in self.ledger.func_map.items():
+            ev.add(str(key))
+            for r in (v.get("refs") or []):
+                ev.add(str(r))
+        for a in self.store.list_artifacts(self.run_id):
+            ev.add(f"artifact#{a['id']}")
+        return ev
+
+    def compact_history(self, summary_text: str) -> None:
+        """L3:把 append-only 历史整体替换为一条交接摘要。
+
+        Codex 的形态要求:摘要必须落在历史**最末**(模型是按这个形态训练的)。且摘要
+        **不孤军作战** —— 台账/facts/用户提示照旧由动态尾区承载,它们是工具产出的
+        结构化真实证据,比 LLM 改写过的摘要可信。
+        被替换掉的原始往返不丢:全文早已在 SQLite,可 recall 分页取回。
+        """
+        self._compact_n += 1
+        self.exchanges = [{"thought": None, "tool": None, "args": {},
+                           "obs": summary_text, "cid": None, "art_id": None,
+                           "summary": True}]
+        self._call_seq = 0
+
+    # —— 动态尾区:唯一每步变化的段落 ——
+    def dynamic_tail(self) -> str:
+        """放在 messages 最末的动态区。顺序 = 优先级。
+
+        为什么放最末(而非旧实现的 msg[1]):
+        ① 缓存 —— mlx PromptTrie 只在"新 prompt 是旧 prompt 的扩展"时免 trim 复用;
+           台账每步都变,放前缀等于让其后所有 KV 失效,放最末则只失效这一段。
+        ② 注意力 —— 近因效应让尾部处于注意力峰值,台账/TODO 正需要被看见。
+        两个目标在此**同向**,不是取舍。
+        """
         lines = []
         if self.user_hints:     # 人工干预:置顶、最高优先级
             lines.append("## ⚠️⚠️ 用户实时提示(**最高优先级,立即照做,别再走老路/别再自我怀疑**):")
@@ -527,26 +330,40 @@ class ContextManager:
         if self.facts:
             lines.append("- 已确认事实: " + "; ".join(self.facts[-8:]))
         lines.append(self.ledger_block())
+        todo = render_todo(self.plan_steps, self._tools_used())
+        if todo:
+            lines.append("")
+            lines.append(todo)      # 最末:近因效应峰值(Manus 注意力锚定)
         return "\n".join(lines)
 
-    # —— 每步重建 messages(稳定前缀在前) ——
+    # —— 供 planner 侧(ledger_text)与既有调用点复用 ——
+    def working_memory_block(self) -> str:
+        return self.dynamic_tail()
+
+    # —— 每步重建 messages(cache 友好布局)——
     def build_messages(self, system_prompt, task):
+        """布局:[静态 system] + [半静态 task/Plan] + [append-only 工具往返] + [动态尾区]。
+
+        历史**不再滑窗**:append-only 让本次 prompt 恰为上次 prompt 的扩展,命中 mlx
+        PromptTrie 的 `shorter` 路径(只 prefill 增量、免 trim)。上下文规模由 L1/L3 压缩层
+        承接,不靠丢弃最近步骤。
+
+        本方法现在是**纯函数**:不再在渲染时改写任何 exchange(run_python 占位符已在
+        push_exchange 时冻结),所以同样的 exchanges 永远渲染出同样的字节。
+        """
         msgs = [{"role": "system", "content": system_prompt},
-                {"role": "user", "content": task + "\n\n" + self.working_memory_block()}]
-        win = self.exchanges[-self.window:]
-        # run_python 脚本只保留最近一次的全文;更早的换占位(反编译等其它工具结果一律全量保留)
-        last_py = max((i for i, ex in enumerate(win) if ex.get("tool") == "run_python"), default=-1)
-        for i, ex in enumerate(win):
-            thought, tool, args, obs, cid = ex["thought"], ex["tool"], ex["args"], ex["obs"], ex.get("cid")
+                {"role": "user", "content": task}]
+        for ex in self.exchanges:
+            thought, tool, args = ex["thought"], ex["tool"], ex["args"]
+            obs, cid = ex["obs"], ex.get("cid")
+            if ex.get("summary"):       # L3 交接摘要:单独一条 user,且始终在历史最末
+                msgs.append({"role": "user", "content": obs})
+                continue
             if tool is None:
                 # 无 tool_call(格式纠错/被拒 flag):assistant 正文 + user 追问
                 msgs.append({"role": "assistant", "content": thought or "(无输出)"})
                 msgs.append({"role": "user", "content": obs})
                 continue
-            if tool == "run_python" and i != last_py and isinstance(args, dict) and args.get("code"):
-                args = dict(args)
-                n = len(args["code"])
-                args["code"] = f"<此前脚本已省略({n}字符);只保留最近一次 run_python 全文,历史尝试看其 OBSERVATION 输出>"
             asst = {"role": "assistant",
                     "tool_calls": [{"id": cid, "type": "function",
                                     "function": {"name": tool,
@@ -555,6 +372,7 @@ class ContextManager:
                 asst["content"] = thought
             msgs.append(asst)
             msgs.append({"role": "tool", "tool_call_id": cid, "content": obs})
+        msgs.append({"role": "user", "content": self.dynamic_tail()})
         return msgs
 
     def push_exchange(self, thought, tool=None, args=None, observation_text=""):
@@ -564,6 +382,30 @@ class ContextManager:
         if tool is not None:
             self._call_seq += 1
             cid = f"call_{self._call_seq}"
-        self.exchanges.append({"thought": thought, "tool": tool,
-                               "args": args if isinstance(args, dict) else {},
-                               "obs": observation_text, "cid": cid})
+        args = dict(args) if isinstance(args, dict) else {}
+        self.exchanges.append({"thought": thought, "tool": tool, "args": args,
+                               "obs": observation_text, "cid": cid,
+                               "art_id": self._last_art_id})
+        self._last_art_id = None        # 用掉即清,避免误关联到下一步
+        if tool == "run_python" and args.get("code"):
+            self._freeze_prior_py()     # 决策冻结:新脚本入队后,把过老的脚本一次性定型
+
+    def _freeze_prior_py(self) -> None:
+        """把除最近 KEEP_PY_FULL 次之外的 run_python code 换成占位符,**且只换一次、此后不再动**。
+
+        两个目的:
+        ① 缓存 —— 写回 exchanges 后 build_messages 成为纯函数,不再每步按"当前最后一个 py"
+           动态重算。改动次数从 O(步数) 降到 O(run_python 次数)。
+        ② 可诊断(P0-5)—— 保留最近 **2** 次而非 1 次全文,模型能对比"上次错在哪、这次改了什么"。
+           只留 1 次时,步11 的 ValueError 与步12 的半截 flag 之间的代码差就看不见了(5985 教训)。
+        """
+        py_idx = [i for i, ex in enumerate(self.exchanges)
+                  if ex["tool"] == "run_python" and (ex["args"] or {}).get("code")]
+        for i in py_idx[:-KEEP_PY_FULL] if KEEP_PY_FULL else py_idx:
+            ex = self.exchanges[i]
+            code = ex["args"]["code"]
+            if code.startswith("<此前脚本已省略"):
+                continue                # 已冻结 → 幂等,不重写(重写会打破字节稳定)
+            ex["args"] = dict(ex["args"])
+            ex["args"]["code"] = (f"<此前脚本已省略({len(code)}字符);只保留最近 {KEEP_PY_FULL} 次 "
+                                  f"run_python 全文,更早的尝试看其 OBSERVATION 输出>")

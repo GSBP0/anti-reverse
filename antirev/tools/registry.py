@@ -112,6 +112,15 @@ TOOLS_SCHEMA = [
         "取某逆向知识点的详细解法(卡住时查:junk_code/vm_obfusc/cipher_modified 等)。",
         {"topic": {**_STR, "description": "知识点主题,如 junk_code"}},
         ["topic"]),
+    _fn("drop_history",
+        "**清理上下文**:把与当前解题方向无关的历史步骤整轮丢弃,腾出上下文空间。"
+        "什么时候用:发现前面某几步(如探索错方向的反编译、无关函数的字节读取)对当下已经没用了。"
+        "序号 = 历史步号(从 1 开始,见台账里的步号)。最近几步和交接摘要受保护、丢不掉。"
+        "丢弃只影响上下文,全文仍在 artifact 里可 recall 取回 —— 放心丢。",
+        {"steps": {"type": "array", "items": _INT,
+                   "description": "要丢弃的历史步号列表(从 1 开始),如 [2,3,7]"},
+         "reason": {**_STR, "description": "为什么这些步骤已无关(一句话)"}},
+        ["steps"]),
     # —— 阶段二/三 新增工具 ——
     _fn("deflower",
         "**去花指令**(反汇编现 junk 征兆:hexrays失败/positive sp/call到0xFFFF../jz$+1 时用):"
