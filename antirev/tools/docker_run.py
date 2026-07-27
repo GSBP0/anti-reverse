@@ -44,11 +44,24 @@ def _select(data: bytes):
     return (None, None, None, None)
 
 
+# "程序压根没跑起来"的迹象 —— 必须在关键词判决**之前**识别:
+# wine 跑 32 位 PE 会打 "Application could not be started / ShellExecuteEx failed",
+# 其中 "failed" 命中 FAIL_KEYWORDS → 被判成 verdict=wrong,等于告诉模型"你的 flag 错了",
+# 会让它把**正确答案**当错的丢掉(R30 实测 7/9 次 docker_run 都栽在这)。
+_NOT_RUN_SIGNS = (
+    "could not be started", "shellexecuteex failed", "wine: cannot find",
+    "exec format error", "cannot execute binary file", "no such file or directory",
+    "permission denied", "not a valid win32 application",
+)
+
+
 def _verdict(text, rc, timed_out) -> str:
-    """判决:timeout(超时) / right(命中成功词) / wrong(命中失败词) / crash(信号/段错误) / ok(正常退出) / unknown。"""
+    """判决:timeout / not_run(没跑起来,**非对错**) / right / wrong / crash / ok / unknown。"""
     if timed_out:
         return "timeout"
     low = (text or "").lower()
+    if any(s in low for s in _NOT_RUN_SIGNS):
+        return "not_run"
     if any(k in low for k in config.SUCCESS_KEYWORDS):
         return "right"
     if any(k in low for k in config.FAIL_KEYWORDS):
@@ -67,6 +80,8 @@ _ADVICE = {
     "wrong": "✗ 程序判定错误(命中失败词)——别提交,回查算法/密钥/字节序重解",
     "crash": "程序崩溃(段错误/abort)——喂的输入格式可能不对,或非此验证方式",
     "timeout": "程序超时(死循环/在等更多输入)——可能不是一次性 stdin 比对型",
+    "not_run": ("⚠ **程序没跑起来**(不是 flag 错!):32 位 PE 需 wine32(本镜像只有 wine64)/格式不被支持。"
+                "**别据此否定你的候选 flag**——改用 emulate_function 跑二进制自身逻辑,或 run_python 正向重算自验"),
     "ok": "程序正常退出但**没输出对错词**——多半不是'读 stdin 比对 flag'型,或该看 stdout 里的真实输出;**别当验证通过**,改正向重算(re-encrypt==密文)自验",
     "unknown": "程序 rc≠0 且无对错反馈——**没验证成功**(输入方式可能不对);别依赖此结果,改正向重算自验或 emulate_function 观测",
 }
