@@ -177,6 +177,9 @@ function addAlert(text, bad = true) {
 
 // ——— 事件分发 ———
 function onAgentEvent(ev) {
+  // 步号统一在入口更新:flag_found / final_rejected / unsolved / step_error 都带 step,
+  // 只在 executor_output 里更新会让顶栏停在最后一次工具决策的步号上(实测停在 #4 而实际已到 #7)。
+  if (ev.step != null) { S.step = ev.step; setRound(); }
   switch (ev.type) {
     case "plan_md":
       S.round = ev.replan ?? 0;

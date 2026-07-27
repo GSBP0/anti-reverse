@@ -122,7 +122,9 @@ def status(run_id: str) -> dict:
         state = ctl.read_state(run_id)
     elif code not in (None, 0):
         state = "crashed"
-    elif run is not None or ctl.ctl_path(run_id).exists():
+    elif run is not None or ctl.ctl_path(run_id).exists() or jsonl_path(run_id).exists():
+        # 有 jsonl 就说明这个 run 真跑过 —— 回放历史 run 时要显示"已结束",不能是"未知"。
+        # 只有既无日志也无 .ctl 的 run_id 才是真的不存在。
         state = "done"
     else:
         state = "unknown"
