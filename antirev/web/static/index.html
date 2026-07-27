@@ -1,3 +1,93 @@
 <!DOCTYPE html>
-<html lang="zh"><head><meta charset="utf-8"><title>antiReverse 作战台</title></head>
-<body><h1>antiReverse 作战台</h1><p>界面建设中</p></body></html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>antiReverse 作战台</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <!-- 启动面板:未选 run 时占满;开跑后收起 -->
+  <section id="launch" class="launch">
+    <h1>antiReverse 作战台</h1>
+    <div class="row">
+      <label>题目二进制</label>
+      <input id="binary" placeholder="点右侧浏览,或直接粘路径">
+      <button id="browse-btn">浏览…</button>
+    </div>
+    <div id="browser" class="browser hidden"></div>
+    <div class="row params">
+      <label>轮数上限 <input id="max_replan" type="number" value="9999"></label>
+      <label>每轮步数 <input id="max_steps" type="number" value="15"></label>
+      <label>总预算(秒) <input id="budget" type="number" value="3600"></label>
+      <label>无进展早停(秒) <input id="stuck" type="number" value="600"></label>
+    </div>
+    <div class="row">
+      <label>初始提示(可选)</label>
+      <input id="init-hint" placeholder="题面额外信息、已知线索…">
+    </div>
+    <div class="row">
+      <button id="start-btn" class="primary">开始解题</button>
+      <span id="launch-msg" class="msg"></span>
+    </div>
+    <div class="row">
+      <label>历史 run</label>
+      <select id="history"></select>
+      <button id="replay-btn">回放</button>
+    </div>
+  </section>
+
+  <!-- 作战台 -->
+  <main id="console" class="console hidden">
+    <header class="topbar">
+      <span id="state-dot" class="dot">●</span>
+      <b id="t-binary">—</b>
+      <span id="t-round">轮 —/— · 步 —/—</span>
+      <span id="t-time">—</span>
+      <span id="t-state" class="state">—</span>
+      <span id="t-flag" class="flag hidden"></span>
+      <span class="spacer"></span>
+      <button id="pause-btn" class="warn">暂停</button>
+      <button id="stop-btn" class="err">停止</button>
+      <button id="back-btn">返回</button>
+    </header>
+
+    <div class="body">
+      <section class="stream">
+        <article id="focus" class="focus">
+          <div class="label">等待第一步…</div>
+        </article>
+        <div class="label hist-label">历史</div>
+        <div id="history-list" class="timeline"></div>
+      </section>
+
+      <aside class="side">
+        <div class="panel">
+          <div class="label">PLAN <span id="plan-round"></span></div>
+          <div id="plan" class="plan">—</div>
+        </div>
+        <div class="panel">
+          <div class="label">台账</div>
+          <div class="kv"><span>函数图</span><b id="m-funcs">0</b></div>
+          <div class="kv"><span>已读字节</span><b id="m-reads">0</b></div>
+          <div class="kv"><span>verified</span><b id="m-verified">∅</b></div>
+          <div class="kv"><span>上下文</span><b id="m-ctx">—</b></div>
+          <div class="bar"><i id="ctx-bar"></i></div>
+        </div>
+        <div class="panel">
+          <div class="label">性能</div>
+          <div class="kv"><span>prefill</span><b id="m-prefill">—</b></div>
+          <div class="kv"><span>输出速度</span><b id="m-tps">—</b></div>
+          <div class="kv"><span>内存占用</span><b id="m-mem">—</b></div>
+        </div>
+        <div class="panel">
+          <div class="label">告警</div>
+          <div id="alerts" class="alerts">无</div>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
