@@ -233,6 +233,20 @@ class ContextManager:
             used += len(chunk)
         return "\n\n".join(parts)
 
+    # —— 渐进式压缩入口(L1/L2;L3 见 compact_history)——
+    def micro_compact(self, protect=None) -> int:
+        """L1:把超出保护窗的旧工具结果换成 artifact 引用(零 LLM 成本、可 recall 取回)。"""
+        from antirev.memory.compact import PROTECT_RECENT_STEPS, micro_compact
+        return micro_compact(self.exchanges,
+                             PROTECT_RECENT_STEPS if protect is None else protect)
+
+    def drop_history(self, steps, reason="") -> dict:
+        """L2:模型主动丢弃与当前任务无关的历史轮次(零 LLM 成本)。"""
+        from antirev.memory.compact import PROTECT_RECENT_STEPS, drop_steps
+        r = drop_steps(self.exchanges, steps, PROTECT_RECENT_STEPS)
+        r["reason"] = reason
+        return r
+
     # —— 动态尾区:唯一每步变化的段落 ——
     def dynamic_tail(self) -> str:
         """放在 messages 最末的动态区。顺序 = 优先级。

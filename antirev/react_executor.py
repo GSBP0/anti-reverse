@@ -566,7 +566,10 @@ class ReactExecutor:
                 except Exception:
                     pass
                 try:
-                    messages = ctx.build_messages(SYSTEM_PROMPT, plan)  # 有界:system+WM+最近window步
+                    # L1:每步先做零成本压缩(超出保护窗的旧工具全文 → artifact 引用)。
+                    # append-only 历史不再靠滑窗控量,上下文压力由 L1/L3 承接。
+                    ctx.micro_compact()
+                    messages = ctx.build_messages(SYSTEM_PROMPT, plan)
                     # 上下文熔断:优先用 mlx 上一步返回的真实 prompt_tokens(准, 免字符估算偏差);首步无前值→字符估算兜底(~2.5字符/token)。
                     # 阈值 51000 = 60k 工作区×85%(留足余量:51k+输出6144=57k<65536 防崩)→ 提前转 planner 归纳压缩。
                     approx = self.client.last_prompt_tokens or (sum(len(m.get("content", "")) for m in messages) * 2 // 5)
