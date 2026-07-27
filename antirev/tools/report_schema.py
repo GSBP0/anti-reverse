@@ -224,13 +224,10 @@ HANDOFF = _fn(
     ["current_goal", "next_actions"],
 )
 
-# 语义锚点:让下一次 L3 能识别并跳过旧摘要(不套娃),也是插入初始上下文时的定位点。
+# 语义锚点:摘要开头固定这一句,人和模型都能一眼认出"这是交接摘要不是真实 user 消息"。
+# (Codex 还用它做 is_summary_message 判定以便下次压缩跳过旧摘要;antirev 不需要 ——
+#  摘要条目在 exchanges 里带 summary=True 标记,判定走标记不走文本匹配。)
 SUMMARY_PREFIX = "【上下文交接摘要】"
-
-
-def is_summary_message(text: str) -> bool:
-    """这条消息是否是历史摘要(而非真实 user 消息)。"""
-    return bool(text) and str(text).lstrip().startswith(SUMMARY_PREFIX)
 
 
 def validate_handoff(d: dict, known_evidence: set | None = None) -> list:
