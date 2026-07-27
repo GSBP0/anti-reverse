@@ -101,6 +101,11 @@ MAX_L3_COMPACTS = 2
 # L3 触发阈值。60k 工作区 × 70%(旧为 51k/85%):压缩请求自身也要带上下文(Codex 教训),
 # 且压完要能继续跑而非立刻再触发。
 L3_TOKEN_THRESHOLD = 42000
+# L1 **按需**触发阈值(≈L3 的 70%)。刻意不每步无条件跑 —— 实测(scripts 下的离线探针)
+# 每步压会让改动点逐步前移、其后最近几步的全文跟着失效,40 步稳态命中率从 78.8% 崩到 28.3%,
+# 完全抵消 append-only 的收益。L1 的价值是"延缓 L3",不是持续瘦身,所以只在快撞阈值时出手:
+# 按需 40 步只触发 3 次、峰值仍 ~30k(<42k),命中率接近尾区决定的理论上限(~90%)。
+L1_TOKEN_THRESHOLD = 30000
 
 
 def _is_progress(tool, obs) -> bool:
@@ -583,13 +588,19 @@ class ReactExecutor:
                 except Exception:
                     pass
                 try:
-                    # L1:每步先做零成本压缩(超出保护窗的旧工具全文 → artifact 引用)。
-                    # append-only 历史不再靠滑窗控量,上下文压力由 L1/L3 承接。
-                    ctx.micro_compact()
                     messages = ctx.build_messages(SYSTEM_PROMPT, plan)
                     # 上下文压力:优先用 mlx 上一步返回的真实 prompt_tokens(准, 免字符估算偏差);
                     # 首步无前值→字符估算兜底(~2.5字符/token)。
                     approx = self.client.last_prompt_tokens or (sum(len(m.get("content", "")) for m in messages) * 2 // 5)
+                    # L1 **按需**:接近阈值才压一次(零 LLM 成本,旧工具全文 → artifact 引用)。
+                    # 不每步压 —— 那会让改动点每步前移、把其后最近几步的全文也作废。
+                    if approx >= L1_TOKEN_THRESHOLD:
+                        freed = ctx.micro_compact()
+                        if freed:
+                            self._log("l1_compact", step=step, freed=freed, before_tokens=approx)
+                            messages = ctx.build_messages(SYSTEM_PROMPT, plan)
+                            # 压过之后真实 prompt_tokens 已过时(偏大),改用字符估算
+                            approx = sum(len(m.get("content", "")) for m in messages) * 2 // 5
                     if approx >= L3_TOKEN_THRESHOLD:
                         # 先 L3 原地压缩续跑(Codex mid-turn compact:任务不中断),
                         # 压满 MAX_L3_COMPACTS 次仍未解出才转 planner 换思路。
