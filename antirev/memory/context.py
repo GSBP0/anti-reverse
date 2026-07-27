@@ -19,7 +19,7 @@ from antirev.memory.fold import (_ADDR_PREFIX, _clip_big, _fold_repeats,  # noqa
 # 指纹/段图/签名渲染已拆到 render.py;同样再导出(tests/test_fingerprint.py 与
 # tests/test_outline_render.py 都从 context 导入)。
 from antirev.memory.render import (_addrs, _first_sig, _parse_addr,  # noqa: F401
-                                   render_fingerprint, render_outline)
+                                   render_fingerprint, render_outline, render_todo)
 # 台账(ACE 增量更新)已拆到 ledger.py。_FLAGISH_RE/_looks_secret 供本模块的 _harvest_facts 用。
 from antirev.memory.ledger import Ledger, _FLAGISH_RE, _looks_secret  # noqa: F401
 
@@ -53,6 +53,7 @@ class ContextManager:
         self.ledger = Ledger()   # 结构化持久台账(ACE 增量更新,常驻上下文、空间有界)
         self._last_art_id = None  # 上一次 record 的 artifact id(供 push_exchange 关联,L1 靠它换引用)
         self._compact_n = 0      # L3 已压缩次数(达 MAX_L3_COMPACTS 转 planner)
+        self.plan_steps = []     # 结构化 Plan 步骤(emit_plan 产物),供 TODO 复述
 
     # —— 台账字段代理:保持 ctx.func_map / ctx.attempts 等既有访问路径可用
     # (react_executor 的台账快照与 _break_hint、以及多处测试都直接读这些名字)——
@@ -89,6 +90,25 @@ class ContextManager:
     # —— 事实/目标 ——
     def set_goal(self, goal):
         self.goal = goal
+
+    def set_plan_steps(self, steps) -> None:
+        """接收结构化 Plan 步骤(emit_plan 的 steps 字段),用于尾部 TODO 复述。"""
+        self.plan_steps = list(steps or [])
+
+    def _tools_used(self) -> set:
+        """已实际调用过的工具名(据台账 + 往返;TODO 勾选判定用,纯规则、不花 LLM)。"""
+        used = {a["tool"] for a in self.ledger.attempts if a.get("tool")}
+        used |= {ex["tool"] for ex in self.exchanges if ex.get("tool")}
+        # 台账的 scans/func_map/reads 也是"某工具跑过"的证据(attempts 只记解题类工具)
+        for key, tool in (("analyze", "analyze"), ("functions", "ida_list_functions"),
+                          ("key_functions", "find_key_functions"), ("floss", "floss")):
+            if key in self.ledger.scans:
+                used.add(tool)
+        if self.ledger.func_map:
+            used.add("ida_decompile")
+        if self.ledger.reads:
+            used.add("ida_read_bytes")
+        return used
 
     def add_fact(self, fact):
         if fact and fact not in self.facts:
@@ -300,6 +320,10 @@ class ContextManager:
         if self.facts:
             lines.append("- 已确认事实: " + "; ".join(self.facts[-8:]))
         lines.append(self.ledger_block())
+        todo = render_todo(self.plan_steps, self._tools_used())
+        if todo:
+            lines.append("")
+            lines.append(todo)      # 最末:近因效应峰值(Manus 注意力锚定)
         return "\n".join(lines)
 
     # —— 供 planner 侧(ledger_text)与既有调用点复用 ——

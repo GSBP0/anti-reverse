@@ -128,6 +128,7 @@ def make_planner(client, logger=None):
                                 {"role": "user", "content": user_msg}],
                                max_tokens=plan_max, timeout=600)
         # C3:追一次强制 emit_plan 把 free-text 结构化(缺字段/幻觉工具→重生成一次;think+tools 崩或失败→回退 free-text)
+        plan_steps = []      # 结构化步骤 → executor 侧尾部 TODO 复述(拿不到就不渲染 TODO)
         try:
             from antirev.tools.report_schema import EMIT_PLAN, validate_plan, render_plan, parse_tool_args
             from antirev.tools.registry import TOOL_NAMES
@@ -144,13 +145,15 @@ def make_planner(client, logger=None):
                 errs = validate_plan(d, TOOL_NAMES)
                 if not errs:
                     plan = render_plan(d)
+                    plan_steps = d.get("steps") or []
                     break
                 msgs.append({"role": "user", "content": f"Plan 有误:{errs}。修正后重新 emit_plan(只用真实工具名)。"})
         except Exception:
             pass
         if logger:
             logger.event("plan_md", replan=replan, plan=plan)
-        return {"pre_analysis": pre, "plan": plan, "status": "executing"}
+        return {"pre_analysis": pre, "plan": plan, "plan_steps": plan_steps,
+                "status": "executing"}
     return planner_node
 
 
@@ -168,6 +171,7 @@ def make_executor(client, logger=None, max_steps=25, deadline=None, db_path=None
         ex = ReactExecutor(binary, client=client, logger=logger, max_steps=max_steps,
                            time_budget=remaining, db_path=db_path,   # 跨轮共享缓存 db_path
                            stuck_seconds=stuck_seconds, progress=progress)  # 跨轮共享 stuck 追踪
+        ex.plan_steps = state.get("plan_steps") or []   # 尾部 TODO 复述用(Manus 注意力锚定)
         result = ex.run(task)
         ev = list(state.get("evidence", []))
         ev.append({"replan": state.get("replan_count", 0), "steps": result.get("steps"),

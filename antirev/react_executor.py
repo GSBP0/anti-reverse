@@ -296,6 +296,7 @@ class ReactExecutor:
         self.db_path = db_path or ":memory:"
         self.active_binary = binary   # 脱壳后会切到 .unpacked
         self._ida = None              # 常驻 IdaSession(一次分析多次查询,避免每步重开 worker)
+        self.plan_steps = []          # 结构化 Plan 步骤(由 graph 注入),供尾部 TODO 复述
         self._ctx = None              # 当轮 ContextManager(供 drop_history 等要改上下文的工具用;
         #                               刻意不进 _dispatch 签名 —— 测试里的 _dispatch 桩是三参)
         self.state = {"find": None, "avoid": None, "candidate": None, "func_hint": None,
@@ -587,6 +588,7 @@ class ReactExecutor:
         ctx = ContextManager(store, self.run_id, window=self.window)
         self._ctx = ctx               # 供 drop_history 用
         ctx.set_goal(plan)
+        ctx.set_plan_steps(self.plan_steps)
         bad_parse = 0                 # 连续无法解析(常因输出超 max_tokens 被截断成半截 JSON)计数
         seen_kb = set()               # 已注入过的知识库条目(每题每条只即时注一次,免刷屏)
         ctx.load_prior(store)         # 跨轮记忆:从 store 重建本题此前所有轮次的工具调用台账

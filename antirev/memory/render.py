@@ -83,3 +83,33 @@ def render_outline(outline, seen=None) -> str:
         lines.append(f"  [seg{s.get('id')}] {star}{s.get('kind')} "
                      f"@{s.get('start')}-{s.get('end')} ({s.get('n_insn')}insn) {mark}  {fp}")
     return "\n".join(lines)
+
+
+def render_todo(steps, done_tools) -> str:
+    """Plan 步骤 → Markdown 任务列表。放上下文最末,把全局计划推进 LLM 近期注意力(Manus)。
+
+    Manus 的观察:平均 50 次工具调用的长循环里,模型很容易偏离主题或忘记早期目标。
+    把 todo 复述到上下文末尾,是纯自然语言的注意力操控 —— 不需要任何架构改动。
+    对 antirev 直击"连续 10+ 步只反编译不动手"这个痛点:explore_n 护栏是事后补救,
+    复述是事前锚定。
+
+    完成判定走规则(该步的 tool 是否已在台账/往返里出现过),不额外花 LLM 调用。
+    格式细节有意义:`- [x] #1 ` 里每个空格都是模型识别列表项的锚点。
+    """
+    if not steps:
+        return ""
+    done = {str(t) for t in (done_tools or ())}
+    lines = ["## 当前 TODO(照此推进;别停在探索,轮到动手就动手)"]
+    cur_marked = False
+    for i, s in enumerate(steps, 1):
+        s = s or {}
+        tool = str(s.get("tool") or "").strip()
+        ok = bool(tool) and tool in done
+        seg = f"- [{'x' if ok else ' '}] #{i}: {s.get('goal', '')}"
+        if tool:
+            seg += f" [{tool}]"
+        if not ok and not cur_marked:
+            seg += "   ← 当前这步"
+            cur_marked = True
+        lines.append(seg)
+    return "\n".join(lines)
