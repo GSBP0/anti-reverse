@@ -23,6 +23,10 @@ from antirev.memory.render import (_addrs, _first_sig, _parse_addr,  # noqa: F40
 # 台账(ACE 增量更新)已拆到 ledger.py。_FLAGISH_RE/_looks_secret 供本模块的 _harvest_facts 用。
 from antirev.memory.ledger import Ledger, _FLAGISH_RE, _looks_secret  # noqa: F401
 
+# 保留最近几次 run_python 的脚本全文。=1 时"上次错在哪、这次改了什么"的代码差就看不见了
+# (P0-5/5985:步11 ValueError 与步12 半截 flag 之间无法对比 → 同错重试)。=2 够诊断又不占太多。
+KEEP_PY_FULL = 2
+
 
 def _brief_args(args, cap=100) -> str:
     if not args:
@@ -47,6 +51,8 @@ class ContextManager:
         self.exchanges = []      # [dict(thought,tool,args,obs,cid)] 原生 tool_calls 往返
         self._call_seq = 0       # 合成 tool_call_id 自增计数(回放需 assistant.tool_calls 与 role:tool 配对)
         self.ledger = Ledger()   # 结构化持久台账(ACE 增量更新,常驻上下文、空间有界)
+        self._last_art_id = None  # 上一次 record 的 artifact id(供 push_exchange 关联,L1 靠它换引用)
+        self._compact_n = 0      # L3 已压缩次数(达 MAX_L3_COMPACTS 转 planner)
 
     # —— 台账字段代理:保持 ctx.func_map / ctx.attempts 等既有访问路径可用
     # (react_executor 的台账快照与 _break_hint、以及多处测试都直接读这些名字)——
@@ -105,6 +111,7 @@ class ContextManager:
         if len(full) > self.big_threshold and isinstance(ctx_view, dict):
             ctx_view["_artifact_id"] = art_id
             ctx_view["_hint"] = f"全文已存 artifact#{art_id},需要重看用 recall"
+        self._last_art_id = art_id      # 供 push_exchange 关联(L1 要靠它把旧全文换成 recall 引用)
         note = f"步{step}: {tool}({_brief_args(args)}) → {brief} [artifact#{art_id}]"
         self.step_notes.append(note)
         return f"OBSERVATION: {json.dumps(ctx_view, ensure_ascii=False)}"
@@ -226,8 +233,16 @@ class ContextManager:
             used += len(chunk)
         return "\n\n".join(parts)
 
-    # —— Working Memory 渲染(§6.1):目标 + 事实 + 结构化台账 ——
-    def working_memory_block(self) -> str:
+    # —— 动态尾区:唯一每步变化的段落 ——
+    def dynamic_tail(self) -> str:
+        """放在 messages 最末的动态区。顺序 = 优先级。
+
+        为什么放最末(而非旧实现的 msg[1]):
+        ① 缓存 —— mlx PromptTrie 只在"新 prompt 是旧 prompt 的扩展"时免 trim 复用;
+           台账每步都变,放前缀等于让其后所有 KV 失效,放最末则只失效这一段。
+        ② 注意力 —— 近因效应让尾部处于注意力峰值,台账/TODO 正需要被看见。
+        两个目标在此**同向**,不是取舍。
+        """
         lines = []
         if self.user_hints:     # 人工干预:置顶、最高优先级
             lines.append("## ⚠️⚠️ 用户实时提示(**最高优先级,立即照做,别再走老路/别再自我怀疑**):")
@@ -241,24 +256,34 @@ class ContextManager:
         lines.append(self.ledger_block())
         return "\n".join(lines)
 
-    # —— 每步重建 messages(稳定前缀在前) ——
+    # —— 供 planner 侧(ledger_text)与既有调用点复用 ——
+    def working_memory_block(self) -> str:
+        return self.dynamic_tail()
+
+    # —— 每步重建 messages(cache 友好布局)——
     def build_messages(self, system_prompt, task):
+        """布局:[静态 system] + [半静态 task/Plan] + [append-only 工具往返] + [动态尾区]。
+
+        历史**不再滑窗**:append-only 让本次 prompt 恰为上次 prompt 的扩展,命中 mlx
+        PromptTrie 的 `shorter` 路径(只 prefill 增量、免 trim)。上下文规模由 L1/L3 压缩层
+        承接,不靠丢弃最近步骤。
+
+        本方法现在是**纯函数**:不再在渲染时改写任何 exchange(run_python 占位符已在
+        push_exchange 时冻结),所以同样的 exchanges 永远渲染出同样的字节。
+        """
         msgs = [{"role": "system", "content": system_prompt},
-                {"role": "user", "content": task + "\n\n" + self.working_memory_block()}]
-        win = self.exchanges[-self.window:]
-        # run_python 脚本只保留最近一次的全文;更早的换占位(反编译等其它工具结果一律全量保留)
-        last_py = max((i for i, ex in enumerate(win) if ex.get("tool") == "run_python"), default=-1)
-        for i, ex in enumerate(win):
-            thought, tool, args, obs, cid = ex["thought"], ex["tool"], ex["args"], ex["obs"], ex.get("cid")
+                {"role": "user", "content": task}]
+        for ex in self.exchanges:
+            thought, tool, args = ex["thought"], ex["tool"], ex["args"]
+            obs, cid = ex["obs"], ex.get("cid")
+            if ex.get("summary"):       # L3 交接摘要:单独一条 user,且始终在历史最末
+                msgs.append({"role": "user", "content": obs})
+                continue
             if tool is None:
                 # 无 tool_call(格式纠错/被拒 flag):assistant 正文 + user 追问
                 msgs.append({"role": "assistant", "content": thought or "(无输出)"})
                 msgs.append({"role": "user", "content": obs})
                 continue
-            if tool == "run_python" and i != last_py and isinstance(args, dict) and args.get("code"):
-                args = dict(args)
-                n = len(args["code"])
-                args["code"] = f"<此前脚本已省略({n}字符);只保留最近一次 run_python 全文,历史尝试看其 OBSERVATION 输出>"
             asst = {"role": "assistant",
                     "tool_calls": [{"id": cid, "type": "function",
                                     "function": {"name": tool,
@@ -267,6 +292,7 @@ class ContextManager:
                 asst["content"] = thought
             msgs.append(asst)
             msgs.append({"role": "tool", "tool_call_id": cid, "content": obs})
+        msgs.append({"role": "user", "content": self.dynamic_tail()})
         return msgs
 
     def push_exchange(self, thought, tool=None, args=None, observation_text=""):
@@ -276,6 +302,30 @@ class ContextManager:
         if tool is not None:
             self._call_seq += 1
             cid = f"call_{self._call_seq}"
-        self.exchanges.append({"thought": thought, "tool": tool,
-                               "args": args if isinstance(args, dict) else {},
-                               "obs": observation_text, "cid": cid})
+        args = dict(args) if isinstance(args, dict) else {}
+        self.exchanges.append({"thought": thought, "tool": tool, "args": args,
+                               "obs": observation_text, "cid": cid,
+                               "art_id": self._last_art_id})
+        self._last_art_id = None        # 用掉即清,避免误关联到下一步
+        if tool == "run_python" and args.get("code"):
+            self._freeze_prior_py()     # 决策冻结:新脚本入队后,把过老的脚本一次性定型
+
+    def _freeze_prior_py(self) -> None:
+        """把除最近 KEEP_PY_FULL 次之外的 run_python code 换成占位符,**且只换一次、此后不再动**。
+
+        两个目的:
+        ① 缓存 —— 写回 exchanges 后 build_messages 成为纯函数,不再每步按"当前最后一个 py"
+           动态重算。改动次数从 O(步数) 降到 O(run_python 次数)。
+        ② 可诊断(P0-5)—— 保留最近 **2** 次而非 1 次全文,模型能对比"上次错在哪、这次改了什么"。
+           只留 1 次时,步11 的 ValueError 与步12 的半截 flag 之间的代码差就看不见了(5985 教训)。
+        """
+        py_idx = [i for i, ex in enumerate(self.exchanges)
+                  if ex["tool"] == "run_python" and (ex["args"] or {}).get("code")]
+        for i in py_idx[:-KEEP_PY_FULL] if KEEP_PY_FULL else py_idx:
+            ex = self.exchanges[i]
+            code = ex["args"]["code"]
+            if code.startswith("<此前脚本已省略"):
+                continue                # 已冻结 → 幂等,不重写(重写会打破字节稳定)
+            ex["args"] = dict(ex["args"])
+            ex["args"]["code"] = (f"<此前脚本已省略({len(code)}字符);只保留最近 {KEEP_PY_FULL} 次 "
+                                  f"run_python 全文,更早的尝试看其 OBSERVATION 输出>")
