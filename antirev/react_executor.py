@@ -1,14 +1,16 @@
-"""自研 ReAct 文本协议 Executor(§12)——针对本地端点(mlx_lm.server)实测特性:
+"""自研 ReAct Executor(§12)——跑在本地端点(mlx_lm.server + qwen3.6-35b-a3b)上。
 
-- 端点**不支持原生 tool_calls**(把工具调用当文本返回),故用显式文本协议 + 严格解析 + 纠错重试。
+- **走原生 tool_calls**(2026-07-21 迁移):框架层与模型 chat_template 两层都支持,
+  `complete_tools` 发 tools=TOOLS_SCHEMA、`decode_native` 解析结构化 tool_calls。
+  THOUGHT 靠 system prompt 强制"先在 content 写一句理由再调工具"保留。
+  (旧注释曾写"端点不支持原生 tool_calls",该前提已被源码核实证伪;文本 ACTION 协议与
+   随之而来的 TOOL_SPEC/parse_step/_compress_output 均已删除。)
 - 模型是 thinking 模型;用 chat_template_kwargs.enable_thinking=false **关思考**(§3.3),实测省 ~16x 延迟。
 - 步数不设过紧上限(信任模型自纠);工具/解析出错回喂让模型改。
 
-协议:每步模型输出(可含一行 THOUGHT,会被忽略)
-    ACTION: {"tool":"<名>","args":{...}}          # 调用工具
-  或(拿到真 flag 后)
-    FINAL: <flag>
-Executor 解析 ACTION → 执行 → 追加 OBSERVATION,循环至 FINAL 或步数上限。
+上下文由 `memory/context.ContextManager` 管:静态 system → 半静态 task/Plan →
+append-only 往返 → 动态尾区(台账/TODO)。压力由 L1(每步)/L2(模型调 drop_history)/
+L3(42k 阈值出交接摘要)三层承接,压满 MAX_L3_COMPACTS 才转 planner。详见 docs/context.md。
 
 两条通用解题路线(不针对单题):
   (A) 读懂算法→写逆运算:ida_decompile 读逻辑 → 若可逆(异或/编码/TEA/XTEA/RC4/移位…),
@@ -64,46 +66,6 @@ from antirev.tools.terminal import terminal as _run_terminal
 from antirev.tools.run_code import run_python as _run_python
 from antirev.tools import analyze_tools as _analyze
 from antirev.tools.registry import TOOLS_SCHEMA
-
-TOOL_SPEC = """可用工具(每步只调一个):
-- analyze         args:{}                                看格式/架构/位数/导入数/是否加壳。**开局先调它**
-- floss           args:{}                                提取(含运行时解密的)混淆字符串,静态看不到明文时用
-- solve_stateless_transform args:{"start":"0x..(变换区起点,近似即可)","stop":"0x..(memcmp的地址=call跳转目标)","cipher_len":32,"prefix":"flag{","suffix":"}"}
-                                                         **【最省事·位置无关字节变换首选】一键求解**:题型=读输入→对每字节做同样的独立变换(xor/add/移位/查表/多轮/花指令混淆)→memcmp比密文。
-                                                         你只给:①start=变换区起点(格式检查后第一条变换,**近似即可,工具自动校准±24字节**) ②stop=**memcmp 的地址**(call memcmp 跳转的目标,如 memcmp@plt 0x4004xx) ③cipher_len ④输入格式 prefix/suffix。
-                                                         **cipher_addr 通常不用给**(跑到 memcmp 自动抓)。自动校准start+枚举建表+逆推+自验,返回{flag,verified,start_used}。**免手写 unicorn/建表(高频出错处)**。要求变换位置无关(每字节独立)。
-- emulate_function args:{"start":"0x..","stop":"0x..","input_hex":"..","input_reg":"rdx","read_offset":0,"read_size":32}
-                                                         **高层模拟**(位置相关/需自己观测输出时用):遇花指令/魔改/超长运算,别静态硬复现——用它跑二进制自身逻辑。
-                                                         自动把 input_hex 放进缓冲区、令 input_reg 指向它、从 start 跑到 stop、读回缓冲区[read_offset:+read_size]=output_hex。
-                                                         逐字节变换求逆:对 input 喂 00..ff 各跑一次建 F 表,flag[i]=F⁻¹(密文[i])。
-- unicorn_emulate args:{"start":"0x..","stop":"0x..","regs":{"rdi":..},"mem_writes":[{"addr":..,"data_hex":".."}],"read_mem":{"addr":..,"size":..}}
-                                                         底层模拟(需自己设寄存器/内存);一般用上面的 emulate_function 更省事
-- ida_list_functions args:{"filter":"可选子串"}          列出函数(名+地址)。找不到某函数名时用它定位!
-- find_key_functions args:{"top":12}                     **无符号(全 sub_)/找不到 main 时先用它**:给所有函数按"像不像校验/加密函数"打分排序(main可达+循环+密码运算+比较+flag/对错串+读输入API),返回 top-N+每个上榜理由。据此**优先反编译高分函数**,别在无名函数里按地址乱翻
-- ida_decompile   args:{"name_or_addr":"main|0x.."}      反编译一个函数。返回 pseudocode + data_refs(引用的数据真实地址)
-                                                         + callees(调用的函数名+地址)。顺 callees 逐层深入(如 main→check_flag)
-                                                         **若 hexrays 解不了会自动改回反汇编(disasm)给你,据汇编分析即可**
-                                                         **大函数附 outline 分段地图(每段特征+★核心段+地址);别盲读全文,据图用 ida_disasm(end=段end) 下钻★核心段**
-- ida_disasm      args:{"name_or_addr":"0x..","count":80,"end":"0x.."} 反汇编。**ida_decompile 报 hexrays失败/伪代码可疑时用它**;大函数据 outline 段图下钻:给 end=段end 只反汇编 [addr,end) 那段
-- ida_read_bytes  args:{"name_or_addr":"0x..","size":N}  读密文/密钥等原始字节(返回 hex)。**按 data_refs 给的真实地址读,别用伪代码显示名**
-- run_python      args:{"code":"<python>"}                跑解题脚本(有 pwntools/z3/pycryptodome/gmpy2;变量 BINARY 是题目路径)。
-                                                         **魔改算法:先把伪代码里的核心运算式原样抄成注释、再逐行翻译成 Python**(照抄防手滑漏掉 +1/加常量/查表偏移等细节)
-                                                         **脚本里可直接用 `emulate(start,stop,input_hex=..,input_reg='rdx',read_offset=..,read_size=..)` 模拟二进制片段**
-                                                         (返回{ok,output_hex}),配合 `pwn.ELF(BINARY).read(va,n)` 读数据——花指令/魔改题可一个脚本建表求逆
-- solve_locate    args:{}                                确定性定位成功/失败分支地址
-- solve_angr      args:{"stdin_len":N}                    符号执行求输入(自动用已定位 find/avoid)
-- solve_verify    args:{}                                把上一步 angr 候选喂回二进制自验
-- terminal        args:{"command":"..."}                 **任意 shell 命令**(bash -c,支持管道/重定向/复合)。用系统 CLI 补内置工具:decompyle3/pyinstxtractor-ng(解PyInstaller)/upx/binwalk/objdump 等;写解题脚本仍优先 run_python、实跑验证仍优先 docker_run
-- recall          args:{"artifact_id":N}                 重看某步观察的全文(早前步骤只留摘要,需要时按 artifact#N 取回)
-- recall_knowledge args:{"topic":"junk_code|vm_obfusc|cipher_modified|.."}  取某逆向知识点的详细解法(卡住时查:花指令/VM/魔改密码等)
-- deflower         args:{"start":"0x.."}  **去花指令**(hexrays失败/positive sp/call到0xFFFF..时):从真实控制流重对齐,剔除不透明跳转+junk,输出净化汇编。读不懂花指令函数先它
-- unpack_dump      args:{}  通用脱壳(非UPX的壳/高熵):unicorn跑到OEP+dump+重建,自动在dump上分析
-- docker_run       args:{"stdin_hex":"候选flag的hex"}  **受控docker沙箱实跑验证**:喂stdin实跑、三态判right/wrong/crash。验证候选flag首选强手段(比正向重算硬);docker缺失自动降级
-- pyinstxtract     args:{}  PyInstaller exe→提取.pyc(decompyle3反编译)
-- dotnet_info      args:{}  .NET程序集:列方法+#US用户串(flag模板常在此);看CIL用 dotnet_cil
-- dotnet_cil       args:{"method":".."}  反汇编某.NET方法的CIL
-- report_unsolved  args:{"reason":".."}  **诚实退出**(仅二进制无密文可对:md5(未知输入)等):给候选+原因,不逼造假。能验证的题禁用
-- check_flag  args:{"flag":".."}  **提交前校验候选**(算出但怀疑格式/拿不准时先对答案,别自我否定瞎折腾):回 correct(确认对→直接submit_flag)/wrong(不对→换算法密钥字节序重解)/no_truth(无参考→正向重算或docker_run自验)。先真解出再确认,别枚举爆破"""
 
 SYSTEM_PROMPT = f"""你是逆向 Executor,目标是解出 flag。开局先 analyze 看清格式/架构/是否加壳;若加壳(如 UPX)先 terminal 调 `upx -d` 脱壳。然后按题选两条通用路线之一:
 (A) 读懂算法→写逆运算:先 ida_decompile 读 main/校验逻辑,顺 callees 逐层看清算法。若是标准可逆算法

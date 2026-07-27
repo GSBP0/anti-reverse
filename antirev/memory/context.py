@@ -1,12 +1,22 @@
-"""Executor 上下文管理(§6):Working Memory + 结构化持久台账 + 历史窗口 + 外部记忆引用。
+"""Executor 上下文编排:消息装配 + 事实 + 压缩触发。
 
-目标(§6 核心):让上下文**始终概括当前全部进度**,且远低于 64k。做法:
-- **结构化台账(ledger)**:每次工具调用的关键结果按类型沉淀(函数地图/已读字节/解题尝试/概况),
-  **永久常驻上下文**(不随窗口滑出),空间有界(每类去重+截断)。→ executor 牢记已知,不重复不空转。
-- 只保留最近 window 步的**原始观察全文**(近处细节);更早步由台账代表(远处只留骨架)。
-- 大观察(反编译等)全文进 SQLite(§6.3),上下文只留结构化提取 + artifact#id(可 recall)。
-- 台账可从 store 跨轮重建(load_prior)→ 下一轮 executor / planner 继承前几轮的全部发现。
-- 每步重建 messages = [system] + [task+台账(稳定前缀)] + [最近 window 步原始往返]。稳定前缀在前利于 KV 复用(§6.4)。
+目标:让上下文**始终概括当前全部进度**,且远低于 64k 工作区。布局(§6.4 缓存友好):
+
+    [system]                  角色+纪律+knowledge.checklist()   ← 全 run 静态
+    [user] task               题面+预分析+Plan                   ← 本轮静态
+    [assistant/tool] × N      工具往返,**append-only**           ← 入队即冻结
+    [user] dynamic_tail()     用户提示→事实→台账→TODO            ← 唯一每步变化段
+
+变化段放**最末**而非旧版的 msg[1]:mlx_lm.server 用 PromptTrie 做 common-prefix KV 复用
+(mlx_lm/models/cache.py:1674),append-only 让本次 prompt 恰为上次 prompt 的扩展 →
+命中 `shorter` 路径,只 prefill 增量且免 trim。近因注意力也偏爱尾部 —— 两者同向。
+
+分工:
+- 台账(`ledger.Ledger`):工具结果按类型增量沉淀,常驻、有界。ACE 式增删改,不让 LLM 整体重写。
+- 外部记忆(`store`):大观察全文进 SQLite,上下文只留结构化提取 + artifact#id(可 recall 分页)。
+- 压缩(`compact`):L1 每步把旧工具全文换 artifact 引用;L2 模型主动丢无关轮次;
+  L3 到阈值出交接摘要替换历史。全部遵守**决策冻结** —— 每处只改一次,此后字节不变。
+- 跨轮:`load_prior` 从 store 重建台账 → 下一轮 executor/planner 继承前几轮全部发现。
 """
 from __future__ import annotations
 import json
