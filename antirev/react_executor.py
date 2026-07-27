@@ -9,8 +9,9 @@
 - 步数不设过紧上限(信任模型自纠);工具/解析出错回喂让模型改。
 
 上下文由 `memory/context.ContextManager` 管:静态 system → 半静态 task/Plan →
-append-only 往返 → 动态尾区(台账/TODO)。压力由 L1(每步)/L2(模型调 drop_history)/
-L3(42k 阈值出交接摘要)三层承接,压满 MAX_L3_COMPACTS 才转 planner。详见 docs/context.md。
+append-only 往返 → 动态尾区(台账/TODO)。压力由 L1(≥32k 按需)/L2(模型调 drop_history)/
+L3(≥45k 出交接摘要)三层承接,压满 MAX_L3_COMPACTS 才转 planner。按 64k 窗口精算:
+65536 - 6144(输出预留) = 59392 prompt 预算。详见 docs/context.md。
 
 两条通用解题路线(不针对单题):
   (A) 读懂算法→写逆运算:ida_decompile 读逻辑 → 若可逆(异或/编码/TEA/XTEA/RC4/移位…),
@@ -98,14 +99,17 @@ _FLAGISH_RE = re.compile(r"[A-Za-z0-9_]{2,}\{[^}]{2,}\}")   # flag 样式,用于
 
 # L3 原地压缩次数上限。超过说明本轮方向可能就是错的 → 转 planner 换思路,而不是无限压着跑。
 MAX_L3_COMPACTS = 2
-# L3 触发阈值。60k 工作区 × 70%(旧为 51k/85%):压缩请求自身也要带上下文(Codex 教训),
-# 且压完要能继续跑而非立刻再触发。
-L3_TOKEN_THRESHOLD = 42000
-# L1 **按需**触发阈值(≈L3 的 70%)。刻意不每步无条件跑 —— 实测(scripts 下的离线探针)
-# 每步压会让改动点逐步前移、其后最近几步的全文跟着失效,40 步稳态命中率从 78.8% 崩到 28.3%,
-# 完全抵消 append-only 的收益。L1 的价值是"延缓 L3",不是持续瘦身,所以只在快撞阈值时出手:
-# 按需 40 步只触发 3 次、峰值仍 ~30k(<42k),命中率接近尾区决定的理论上限(~90%)。
-L1_TOKEN_THRESHOLD = 30000
+# —— 上下文预算(按端点真实 64k 窗口精算)——
+CONTEXT_WINDOW = 65536           # mlx_lm.server --max-tokens 65536
+EXEC_MAX_TOKENS = 6144           # executor 每步输出预留(给足推理/公式转录/解题脚本)
+PROMPT_BUDGET = CONTEXT_WINDOW - EXEC_MAX_TOKENS      # = 59392,prompt 的硬上限
+# L3 触发阈值:留 ~14k 余量给"压缩请求自身也要带上下文"(Codex 教训 —— handoff 请求
+# = 当前上下文 + 3072 输出,45000+3072=48072 < 59392 安全),且压完要能继续跑而非立刻再触发。
+L3_TOKEN_THRESHOLD = 45000
+# L1 **按需**触发阈值(≈L3 的 71%)。刻意不每步无条件跑 —— 实测(scripts/probe_prefix_cache.py)
+# 每步压会让改动点逐步前移、其后最近几步的全文跟着失效,40 步稳态命中率从 78.8% 崩到 28.4%,
+# 完全抵消 append-only 的收益。L1 的价值是"延缓 L3",不是持续瘦身,所以只在快撞阈值时出手。
+L1_TOKEN_THRESHOLD = 32000
 
 
 def _is_progress(tool, obs) -> bool:
@@ -622,7 +626,8 @@ class ReactExecutor:
                                           f"转 planner 归纳压缩关键代码段")
                     # max_tokens=6144:给足输出空间,不再截断模型的推理/公式转录/解题脚本(§不裁剪原则)。
                     # 靠 prompt 引导"务实简洁专注直接"来控冗长,而非硬砍 max_tokens(硬砍会连 ACTION/公式一起截没)。
-                    resp = self.client.complete_tools(messages, max_tokens=6144, timeout=300, retries=2)
+                    resp = self.client.complete_tools(messages, max_tokens=EXEC_MAX_TOKENS,
+                                                     timeout=300, retries=2)
                     if resp is None:      # 模型调用重试后仍失败 → 跳过本步(不崩题)
                         continue
                     kind, tool, args, thought, flag = decode_native(resp)
