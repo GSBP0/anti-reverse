@@ -98,3 +98,17 @@ def checkpoint(run_id: str, progress: dict | None = None, logger=None) -> float:
     if logger:
         logger.event("resumed", run_id=run_id, paused_s=round(paused, 1))
     return paused
+
+
+def install_signal_handler(run_id: str = "") -> None:
+    """把 SIGTERM 装成抛 StopRequested。
+
+    为什么用信号而不是等 .ctl 检查点:一步 = 一次 LLM 调用(timeout=300)+ 一次工具
+    调用(IDA 分析 180s),等检查点最坏要 8 分钟。PEP 475 之后,signal handler 抛异常
+    会打断被 EINTR 中断的 syscall,所以它能从 requests.post()/subprocess.run() 里
+    立刻抛出,一路传到 run() 的 finally 走完清理。
+    """
+    def _handler(signum, frame):
+        raise StopRequested(f"收到 SIGTERM{f' (run {run_id})' if run_id else ''}")
+
+    signal.signal(signal.SIGTERM, _handler)
