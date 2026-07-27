@@ -153,8 +153,11 @@ def make_planner(client, logger=None, progress=None):
                      + "\n\n上面是你的分析,现在调用 emit_plan 输出结构化 Plan(steps[].tool 必须是真实工具名):\n" + (plan or "")}]
             force = {"type": "function", "function": {"name": "emit_plan"}}
             for _ in range(2):
+                # think=False:强制 tool_choice 时必须关思考 —— 否则 thinking 吃掉 max_tokens,
+                # arguments 被截断(finish_reason='length')→ 解析失败 → 校验报错 → 整轮白跑。
+                # 前面的 free-text 阶段(client.complete)已经开着 thinking 分析过了,此处只做结构化。
                 m = client.complete_tools(msgs, max_tokens=plan_max, timeout=600,
-                                          tools=[EMIT_PLAN], tool_choice=force)
+                                          tools=[EMIT_PLAN], tool_choice=force, think=False)
                 if m is None:
                     break
                 d = parse_tool_args(m, "emit_plan")

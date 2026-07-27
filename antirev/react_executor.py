@@ -223,15 +223,24 @@ class ChatClient:
         return ""   # 重试全失败 → 返回空,上层当空输出处理,不崩题
 
     def complete_tools(self, messages, max_tokens=6144, temperature=None, timeout=180, retries=3,
-                       tools=None, tool_choice="auto"):
-        """原生 tool_calls 调用。tools 默认 TOOLS_SCHEMA;C3 让 summary/planner 传专用 schema 强约束输出。"""
+                       tools=None, tool_choice="auto", think=None):
+        """原生 tool_calls 调用。tools 默认 TOOLS_SCHEMA;C3 让 summary/planner 传专用 schema 强约束输出。
+
+        think: per-call 覆盖思考开关(None=用 client 默认)。
+        **强制 tool_choice 时务必传 think=False** —— thinking 内容同样计入 completion_tokens,
+        会把 max_tokens 预算吃光,导致 tool_call 的 arguments 写到一半被截断
+        (finish_reason='length')→ JSON 解析失败 → 校验报"steps 为空" → 整轮白跑。
+        实测:planner 的 emit_plan 因此烧掉 6000 token / 161s 又重来一次(占单题 54% 时间)。
+        """
         if temperature is None:
             temperature = self.temperature
+        if think is None:
+            think = self.think
         body = {"model": self.model, "messages": messages,
                 "max_tokens": max_tokens, "temperature": temperature,
                 "tools": tools or TOOLS_SCHEMA, "tool_choice": tool_choice,
-                "enable_thinking": self.think}   # 阿里云/兼容端点思考开关
-        if not self.think:
+                "enable_thinking": think}   # 阿里云/兼容端点思考开关
+        if not think:
             body["chat_template_kwargs"] = {"enable_thinking": False}   # mlx 端点开关(两个都设,各端点认各的)
         for attempt in range(retries):
             try:
@@ -314,7 +323,7 @@ class ReactExecutor:
             d, miss = {}, ["(未产出)"]
             for _ in range(2):
                 m = self.client.complete_tools(msgs, max_tokens=4096, timeout=150,
-                                               tools=[REPORT_PROGRESS], tool_choice=force)
+                                               tools=[REPORT_PROGRESS], tool_choice=force, think=False)
                 if m is None:
                     break
                 d = parse_tool_args(m, "report_progress")
@@ -354,7 +363,7 @@ class ReactExecutor:
                 msgs.append({"role": "user", "content": ask})
                 for _ in range(2):      # 同一份上下文里最多纠错一次(缺字段/证据对不上)
                     m = self.client.complete_tools(msgs, max_tokens=3072, timeout=180,
-                                                   tools=[HANDOFF], tool_choice=force)
+                                                   tools=[HANDOFF], tool_choice=force, think=False)
                     if m is None:
                         break           # 疑似超限 → 跳出内层,走外层的 L1 腾空间重试
                     d = parse_tool_args(m, "context_handoff")
