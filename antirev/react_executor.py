@@ -296,6 +296,8 @@ class ReactExecutor:
         self.db_path = db_path or ":memory:"
         self.active_binary = binary   # 脱壳后会切到 .unpacked
         self._ida = None              # 常驻 IdaSession(一次分析多次查询,避免每步重开 worker)
+        self._ctx = None              # 当轮 ContextManager(供 drop_history 等要改上下文的工具用;
+        #                               刻意不进 _dispatch 签名 —— 测试里的 _dispatch 桩是三参)
         self.state = {"find": None, "avoid": None, "candidate": None, "func_hint": None,
                       "verified": set()}   # D1:通过二进制强验证的 flag(solve_verify/stateless/docker right)
 
@@ -414,6 +416,10 @@ class ReactExecutor:
                         **view}
             if tool == "recall_knowledge":
                 return knowledge.recall(args.get("topic", ""))
+            if tool == "drop_history":      # L2:模型主动清理无关历史(经 self._ctx,不改 _dispatch 签名)
+                if self._ctx is None:
+                    return {"error": "上下文不可用"}
+                return self._ctx.drop_history(args.get("steps") or [], args.get("reason", ""))
             # 只读 IDA 工具:命中缓存直接返回(仅未脱壳时,避免用错二进制的缓存)(§6.3)
             if b == self.binary and tool in ("ida_list_functions", "ida_decompile", "ida_disasm",
                                              "ida_read_bytes", "find_key_functions"):
@@ -579,6 +585,7 @@ class ReactExecutor:
     def run(self, plan: str):
         store = MemoryStore(self.db_path)
         ctx = ContextManager(store, self.run_id, window=self.window)
+        self._ctx = ctx               # 供 drop_history 用
         ctx.set_goal(plan)
         bad_parse = 0                 # 连续无法解析(常因输出超 max_tokens 被截断成半截 JSON)计数
         seen_kb = set()               # 已注入过的知识库条目(每题每条只即时注一次,免刷屏)
