@@ -65,6 +65,18 @@ def _read_description(binary) -> str:
     return ""
 
 
+def _deadline(progress, deadline):
+    """取当前有效的全局截止时刻。
+
+    优先 progress["deadline"] —— 它会被 ctl.checkpoint 在人工暂停后顺延(暂停时长不
+    该算进解题预算)。progress 缺该 key 时回退闭包捕获的静态值,保证既有调用点
+    (tests/test_graph.py、tests/test_router_meltdown.py 直接调 make_router)行为不变。
+    """
+    if progress and progress.get("deadline"):
+        return progress["deadline"]
+    return deadline
+
+
 def make_planner(client, logger=None):
     def planner_node(state):
         binary = state["binary"]
@@ -161,7 +173,8 @@ def make_executor(client, logger=None, max_steps=25, deadline=None, db_path=None
                   stuck_seconds=None, progress=None):
     def executor_node(state):
         binary = state["binary"]
-        remaining = (deadline - time.time()) if deadline else None
+        dl = _deadline(progress, deadline)
+        remaining = (dl - time.time()) if dl else None
         if remaining is not None and remaining <= 5:      # 全局预算用尽
             return {"status": "stuck", "replan_count": state.get("replan_count", 0) + 1}
         _desc = _read_description(binary)   # 题面注入(bug6):executor 也要看到题面给的 name/email/提示
@@ -192,7 +205,8 @@ def make_router(max_replan=9, deadline=None, stuck_seconds=None, progress=None):
     def route_after_executor(state):
         if state.get("flag"):
             return "done"
-        if deadline and time.time() > deadline:      # 全局时间预算到点
+        dl = _deadline(progress, deadline)
+        if dl and time.time() > dl:                  # 全局时间预算到点(暂停已顺延)
             return "fail"
         if stuck_seconds and progress and time.time() - progress.get("last", time.time()) > stuck_seconds:
             return "fail"                            # 10min无新进展,提前判失败

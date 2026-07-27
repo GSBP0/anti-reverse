@@ -38,7 +38,8 @@ def solve(binary, client=None, logger=None, max_replan=9, max_steps=15, budget=N
     client = client or ChatClient()
     deadline = (time.time() + budget) if budget else None
     progress = {"last": time.time(), "seen": set(),   # 跨轮共享进展追踪(stuck 检测/B1 断环用)
-                "loop": {"sig": None, "tool": None, "nth": "", "n": 0}}
+                "loop": {"sig": None, "tool": None, "nth": "", "n": 0},
+                "deadline": deadline}                 # 人工暂停时由 ctl.checkpoint 顺延
     run_id = getattr(logger, "run_id", None) or "solve"
     db_path = str(config.LOG_DIR / f"{run_id}.db")   # 跨轮共享缓存(IDA分析不重复)
     Path(db_path).unlink(missing_ok=True)             # 每次求解清旧缓存
