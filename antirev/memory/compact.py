@@ -21,7 +21,27 @@ from __future__ import annotations
 # K=3 约合 24k 字符 ≈ 9k token,在 60k 工作区内可控,又够模型看清刚做的事。
 PROTECT_RECENT_STEPS = 3
 
+# **模型主动取回的内容受保护**:recall/recall_knowledge 是模型显式表达的信息需求
+# ("我需要重看这段算法")。把它压回引用等于否定模型的判断,而且它多半会立刻再 recall 一次
+# —— 白耗步数、还可能撞上断环守卫。所以这两类结果 pin 住,只保护最近 N 次(防无限累积)。
+_PINNED_TOOLS = {"recall", "recall_knowledge"}
+MAX_PINNED_RECALLS = 3
+
 _L1_MARK = "[已压缩·全文见 artifact"
+
+
+def _ref_artifact_id(ex):
+    """该条目被压缩后,引用应指向哪个 artifact。
+
+    recall 的产物本身也会落一份新 artifact,但那是"取回结果"的快照;真正的信息源是
+    它**取的那个** artifact。若指向自己,就会套娃成 recall→recall 的引用链,
+    模型顺着它取回来的还是同一份摘要。所以 recall 类一律指回 args.artifact_id。
+    """
+    if ex.get("tool") == "recall":
+        src = (ex.get("args") or {}).get("artifact_id")
+        if src:
+            return src
+    return ex.get("art_id")
 
 
 def micro_compact(exchanges, protect=PROTECT_RECENT_STEPS) -> int:
@@ -30,15 +50,19 @@ def micro_compact(exchanges, protect=PROTECT_RECENT_STEPS) -> int:
     只动带 artifact id 的条目(即全文确实已落 SQLite、可 recall 取回的)——没有 id 的
     宁可留着,绝不做不可逆丢弃(这是与 Codex 入口截断的关键差别:那边截掉就真没了)。
     已压过的(带 l1 标记或 _L1_MARK)跳过 → 幂等、冻结。
+    **最近 MAX_PINNED_RECALLS 次主动取回(recall/recall_knowledge)一律不压** —— 见 _PINNED_TOOLS。
     """
     if protect < 0:
         protect = 0
-    cut = len(exchanges) - protect
+    cut = max(0, len(exchanges) - protect)
+    # 最近若干次主动取回:pin 住不压(更早的仍可压,否则长跑会无限累积)
+    pinned = {i for i, ex in enumerate(exchanges) if ex.get("tool") in _PINNED_TOOLS}
+    pinned = set(sorted(pinned)[-MAX_PINNED_RECALLS:])
     n = 0
-    for ex in exchanges[:max(0, cut)]:
-        if ex.get("tool") is None or ex.get("l1"):
+    for i, ex in enumerate(exchanges[:cut]):
+        if ex.get("tool") is None or ex.get("l1") or i in pinned:
             continue
-        aid = ex.get("art_id")
+        aid = _ref_artifact_id(ex)
         if not aid:
             continue
         obs = ex.get("obs") or ""
