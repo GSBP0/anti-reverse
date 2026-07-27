@@ -83,6 +83,22 @@ SSE 用事件的 `seq`（= jsonl 行号）作 `id:`，浏览器重连自动带 `
 - **默认只允许 1 个活跃 run**：并行会抢 mlx 缓存 + IDA worker 内存（每个几百 MB）。启动第二个会返回 409，带 `force=true` 可强制。
 - **不做文件上传**：题面 `description.md` 要在二进制同级目录（向上找 6 层），所以用服务端目录浏览选题，而不是上传单文件。
 - **批量评测不在本界面**：用 `scripts/eval.py`。
+- **命令行起的 run，Web 探测不到它活着**：`status()` 靠 `logs/<run_id>.ctl` 里的 pid 判活，而那个文件是 `runner.start` 写的。想让 Web 观察一个手工起的 run，得自己补一句 `ctl.write_state(run_id, "running", pid=<pid>)`。
+
+## 调试时的坑
+
+**手工起 agent 调试时不要用 `conda run` 包装**，否则 `SIGTERM` 打不到 python 进程：
+
+```bash
+# ✗ 信号会打给 conda run 这层 wrapper,python 子进程收不到 → 不会优雅退出、不输出 __RESULT__
+conda run -n antirev python tests/fixtures/fake_agent.py foo 80 1.5 &
+kill -TERM $(pgrep -f fake_agent | head -1)
+
+# ✓ 直接用环境里的解释器(runner.start_script 内部走的就是 sys.executable,没有这层包装)
+/Users/bytedance/miniconda3/envs/antirev/bin/python tests/fixtures/fake_agent.py foo 80 1.5 &
+```
+
+实测对比：经 `conda run` 起的进程被停止后 stdout 里**没有** `__RESULT__`；`runner.start_script` 起的进程 `stop()` 返回 `{'stopped': 'graceful'}`、耗时 0.3s、`result_of()` 拿到 `{"status": "stopped", "error": "收到 SIGTERM"}`。
 
 ## 依赖
 

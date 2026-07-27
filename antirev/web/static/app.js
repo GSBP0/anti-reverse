@@ -54,8 +54,11 @@ function tickTime() {
 setInterval(tickTime, 1000);
 
 function setRound() {
+  // 深链/回放进入时不知道该 run 的 max_steps(没经过启动表单),分母只是默认值。
+  // 步号一旦超过分母就说明分母不可信 —— 此时只显示步号,免得出现"步 23/15"这种怪数字。
+  const total = S.maxSteps && S.step <= S.maxSteps ? "/" + S.maxSteps : "";
   $("t-round").textContent =
-    `轮 ${S.round + 1}${S.maxReplan ? "/" + (S.maxReplan + 1) : ""} · 步 ${S.step}/${S.maxSteps}`;
+    `轮 ${S.round + 1}${S.maxReplan ? "/" + (S.maxReplan + 1) : ""} · 步 ${S.step}${total}`;
 }
 
 // ——— 焦点卡 / 历史时间轴 ———
