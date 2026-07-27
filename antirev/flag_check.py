@@ -34,6 +34,24 @@ def _inner(flag: str) -> str:
     return _norm(m.group(1)) if m else _norm(flag)
 
 
+def _unwrap_levels(flag: str, max_depth: int = 3) -> list:
+    """逐层剥花括号,返回各层归一化文本 [整串, 第1层内, 第2层内, ...]。
+
+    用于比对时容忍**多包一层前缀**(模型常把原始 flag 再套进 NSSCTF{}:
+    `NSSCTF{suctf{Pwn_@_hundred_years}}`),但**不会**把截断的 flag 认成对
+    (`NSSCTF{Drink_a_c}` 剥出 `drink_a_c` ≠ `drink_a_cup_of_tea!!`)。
+    """
+    out, s = [], (flag or "")
+    out.append(_norm(s))
+    for _ in range(max_depth):
+        m = _FLAG_RE.search(s)
+        if not m:
+            break
+        s = m.group(1)
+        out.append(_norm(s))
+    return [x for x in out if x]
+
+
 def load_truth(path: Path | None = None) -> dict:
     """读权威 truth 库 {pid: {"flag": str, "aliases": [str], ...}};缺文件返回 {}。"""
     p = path or _TRUTH_FILE
@@ -66,11 +84,12 @@ def check(my_flag: str, pid, truth_db: dict | None = None) -> tuple:
         return ("no_truth", None)
     if not my_flag:
         return ("wrong", None)
-    mi, mf = _inner(my_flag), _norm(my_flag)
+    # 逐层剥壳后**精确**比对:前缀无关(收录改写 HDCTF→NSSCTF)、容忍多包一层(NSSCTF{suctf{x}}),
+    # 但绝不认截断/子串(NSSCTF{Drink_a_c} 不等于 NSSCTF{Drink_a_cup_of_tea!!})。
+    mine = _unwrap_levels(my_flag)
     for t in truths:
-        ti, tf = _inner(t), _norm(t)
-        # 花括号内容一致(前缀无关,救收录改写) 或 归一化整串互相包含(容忍前缀/尾缀差异)
-        if mi and ti and (mi == ti or mi in tf or tf in mi or ti in mf or mf in ti):
+        theirs = _unwrap_levels(t)
+        if set(mine) & set(theirs):
             return ("correct", t)
     return ("wrong", None)
 
