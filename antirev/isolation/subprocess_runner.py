@@ -19,6 +19,23 @@ class IsolatedResult:
     timed_out: bool
 
 
+# 模型写的脚本会打印海量数据(实测单次 stdout 达 5.4GB:z3 模型全枚举 → json.dumps 抛
+# OverflowError 把整步观察吞掉,并写出 5.0GB 单题日志)。工具层统一设硬上限防灾。
+# 注:只给 run_python/terminal 用 —— IDA worker 靠 stdout 传 JSON 协议,截断会破坏它。
+OUTPUT_LIMIT = 32000
+
+
+def clip_output(text: str, limit: int = OUTPUT_LIMIT, what: str = "输出") -> str:
+    """超长输出保头尾 + 显式截断标记,让模型知道被裁了并改成只打印关键部分。"""
+    if not text or len(text) <= limit:
+        return text
+    head, tail = limit * 2 // 3, limit // 3
+    return (text[:head]
+            + f"\n...[{what}过长,已截断中间 {len(text) - limit} 字符;"
+              f"别打印整表/整个候选集,只 print 关键结果(如最终 flag)]...\n"
+            + text[-tail:])
+
+
 def run_isolated(cmd, timeout, cwd=None, env=None, input_text=None) -> IsolatedResult:
     """在受管子进程里跑 cmd(list[str]),带超时。
 

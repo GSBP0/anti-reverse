@@ -52,7 +52,7 @@ def _log_tps(usage, finish_reason, wall_s, n_msgs):
 from antirev import config
 from antirev import knowledge
 from antirev.memory.store import MemoryStore, _canon
-from antirev.memory.context import ContextManager
+from antirev.memory.context import ContextManager, _brief_args
 from antirev.tools.ida_tools import IdaSession
 from antirev.tools.solve_locate import locate_targets
 from antirev.tools.solve_angr import solve_angr as _run_angr
