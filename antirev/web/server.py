@@ -59,6 +59,19 @@ def _safe_path(raw: str) -> Path:
     return p
 
 
+@app.middleware("http")
+async def _no_store_static(request: Request, call_next):
+    """静态资源禁缓存。
+
+    本机单人工具,没有带宽顾虑;而 index.html / app.js 走浏览器缓存的话,改完前端要教人
+    按硬刷新才看得到(实测改了文案后页面仍显示旧版,误判成代码没生效)。
+    """
+    resp = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.get("/")
 def index():
     return FileResponse(STATIC / "index.html")

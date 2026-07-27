@@ -215,6 +215,7 @@ function onAgentEvent(ev) {
       setRound();
       break;
     case "executor_output":
+      S.sawStep = true;                 // 之后 metric 不再抢占焦点卡去显示 planner 进度
       if (S.pending) pushHistory(S.pending, { note: "无工具返回" });
       S.pending = ev;
       S.step = ev.step ?? S.step;
@@ -286,6 +287,18 @@ function obsNote(ev) {
 }
 
 function onMetric(m) {
+  // 首个步骤出现前(planner 阶段)焦点卡是空的,用户看不出它在动 —— 实测 planner 首轮要
+  // 2.5 分钟(预分析 → 带 thinking 的规划 → emit_plan 结构化,两次 LLM 调用),
+  // 期间只显示"等待第一步…"会被误判成卡死。metric 每次模型调用都来,拿它当心跳。
+  if (!S.sawStep) {
+    S.llmCalls = (S.llmCalls || 0) + 1;
+    const f = $("focus");
+    f.innerHTML = "";
+    f.append(el("div", "label", "PLANNER 规划中"));
+    f.append(el("div", "thought",
+      `⏳ 正在规划(首轮通常 1-2 分钟:确定性预分析 → 判题型 → 产出 Plan)\n`
+      + `已完成 ${S.llmCalls} 次模型调用,最近一次 ${m.wall_s ?? "?"}s / ${m.tps ?? "?"} tps`));
+  }
   if (m.prompt_tokens != null) {
     const k = (m.prompt_tokens / 1000).toFixed(1);
     const d = S.lastPrefill != null ? m.prompt_tokens - S.lastPrefill : null;
@@ -468,9 +481,10 @@ function showLaunch() {
 function resetState() {
   S.step = 0; S.round = 0; S.startedAt = null; S.pending = null; S.lastPrefill = null;
   S.maxSteps = null; S.agentPaused = false; S.memWarned = false;
+  S.sawStep = false; S.llmCalls = 0;
   S.funcs.clear(); S.reads.clear(); S.verified.clear(); S.alerts = [];
   $("history-list").innerHTML = "";
-  $("focus").innerHTML = '<div class="label">等待第一步…</div>';
+  $("focus").innerHTML = '<div class="label">等待 planner 产出 Plan…</div>';
   $("plan").textContent = "—";
   $("alerts").textContent = "无";
   $("t-flag").classList.add("hidden");
