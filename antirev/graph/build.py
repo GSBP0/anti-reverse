@@ -23,7 +23,7 @@ def build_graph(client, logger=None, max_replan=9, max_steps=15, deadline=None, 
     # planner 开 thinking + 温度 0.4;executor 关 thinking + 温度 0.35。从传入 client 派生同端点(base/model)的两个专用 client。
     planner_client = ChatClient(client.base, client.model, think=True, temperature=0.4)
     executor_client = ChatClient(client.base, client.model, think=False, temperature=0.35)
-    g.add_node("planner", make_planner(planner_client, logger))
+    g.add_node("planner", make_planner(planner_client, logger, progress))
     g.add_node("executor", make_executor(executor_client, logger, max_steps, deadline, db_path,
                                          stuck_seconds, progress))
     g.set_entry_point("planner")

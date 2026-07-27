@@ -12,6 +12,7 @@ from antirev.react_executor import ReactExecutor
 from antirev.tools import analyze_tools as A
 from antirev import knowledge
 from antirev import config
+from antirev import ctl
 
 PLANNER_SYS = (
     "你是逆向题的 Planner。根据确定性预分析判断**题型**并产出简短分步 Plan。\n"
@@ -77,8 +78,11 @@ def _deadline(progress, deadline):
     return deadline
 
 
-def make_planner(client, logger=None):
+def make_planner(client, logger=None, progress=None):
     def planner_node(state):
+        # 轮次边界控制检查点。planner 是一次 timeout=600 的 LLM 调用、中间无循环,
+        # 所以暂停在 planner 执行中无法立即生效 —— 只能在这里(进入前)拦。
+        ctl.checkpoint(getattr(logger, "run_id", None) or "solve", progress, logger)
         binary = state["binary"]
         try:
             pre = state.get("pre_analysis") or _pre_analyze(binary)
