@@ -51,7 +51,10 @@ def pyinstxtract(binary) -> dict:
                             if not l.lstrip().startswith("#") and "::=" not in l
                             and "Reduce " not in l and "invalid by check" not in l)
             if src.strip():
-                decompiled[p.name] = src[:4000]
+                # 截断要留标记+取回方式(静默砍源码会让模型按半截逻辑推错)
+                decompiled[p.name] = (src if len(src) <= 4000 else
+                                      src[:4000] + f"\n# ...[源码共 {len(src)} 字符,此处只给前 4000;"
+                                                   f"全文用 terminal: decompyle3 {p}]")
         except Exception:
             pass
     return {"ok": True, "extracted_dir": str(exdir),
@@ -173,8 +176,13 @@ def dotnet_info(binary) -> dict:
                 break
     except Exception:
         pass
+    # 截断必须报总量:模型看不到"还有多少"就会以为这就是全部,漏掉关键方法/字符串
+    note = "flag 模板常在 user_strings;看某方法 CIL 用 dotnet_cil(name=方法名)"
+    if len(methods) > 300 or len(us) > 200:
+        note += (f"。**已截断**:方法 {len(methods)} 个只列前 300、用户串 {len(us)} 条只列前 200"
+                 f"——没找到目标就用 terminal 调 ilspycmd/monodis 看全量")
     return {"ok": True, "methods": methods[:300], "user_strings": us[:200],
-            "note": "flag 模板常在 user_strings;看某方法 CIL 用 dotnet_cil(name=方法名)"}
+            "methods_total": len(methods), "user_strings_total": len(us), "note": note}
 
 
 def dotnet_cil(binary, method) -> dict:

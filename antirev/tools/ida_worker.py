@@ -93,9 +93,24 @@ def _handle(cmd, a, mods):
                     if d not in dseen:
                         dseen.add(d)
                         b = ida_bytes.get_bytes(d, 16) or b""
-                        drefs.append({"addr": hex(int(d)), "name": idc.get_name(d) or "",
-                                      "preview_hex": b.hex(),
-                                      "preview_ascii": "".join(chr(c) if 32 <= c < 127 else "." for c in b)})
+                        # size:该数据项真实跨度(到下一个已定义符号)。**没有它模型只能照 16 字节预览猜长度**
+                        # ——7067 教训:密文 enc_0 实为 32 字节,模型按预览读了 16 字节,解出半截 flag 就提交。
+                        try:
+                            nxt = idc.next_head(int(d), int(d) + 8192)
+                            span = int(nxt - d) if nxt != idc.BADADDR and nxt > d else 0
+                        except Exception:
+                            span = 0
+                        if not span:
+                            try:
+                                span = int(idc.get_item_size(int(d)) or 0)
+                            except Exception:
+                                span = 0
+                        e = {"addr": hex(int(d)), "name": idc.get_name(d) or "",
+                             "size": span, "preview_hex": b.hex(),
+                             "preview_ascii": "".join(chr(c) if 32 <= c < 127 else "." for c in b)}
+                        if span > len(b):
+                            e["note"] = f"共{span}字节,预览只给了前{len(b)}字节 → 要用全量请 ida_read_bytes(size={span})"
+                        drefs.append(e)
                 for cr in idautils.CodeRefsFrom(item, 0):   # 0: 仅跳转/调用,不含顺序流
                     cfn = ida_funcs.get_func(cr)
                     if cfn and cfn.start_ea == cr and cr != f.start_ea and cr not in cseen:
@@ -162,7 +177,20 @@ def _handle(cmd, a, mods):
         ea = _resolve_data_ea(idc, ida_idaapi, a["name_or_addr"])
         size = int(a["size"])
         data = ida_bytes.get_bytes(ea, size) or b""
-        return {"addr": int(ea), "size": len(data), "hex": data.hex()}
+        out = {"addr": int(ea), "size": len(data), "hex": data.hex()}
+        # 告知该数据项的**真实跨度**:少读了就明说还剩多少。
+        # (7067 教训:密文 32 字节,模型按 16 字节读→解出半截 flag 就提交;旧版靠瞎试 size=64 才蒙对)
+        try:
+            nxt = idc.next_head(int(ea), int(ea) + 8192)
+            span = int(nxt - ea) if nxt != idc.BADADDR and nxt > ea else int(idc.get_item_size(int(ea)) or 0)
+        except Exception:
+            span = 0
+        if span:
+            out["item_size"] = span
+            if span > len(data):
+                out["note"] = (f"该数据项共 {span} 字节,本次只读了 {len(data)} 字节"
+                               f"——**别按这半截推结论**,需要全量就 ida_read_bytes(size={span})")
+        return out
     if cmd == "disasm":
         # 反汇编兜底(hexrays 失败)/ 局部下钻(带 end 做 [ea,end) 范围)——IDA 总能出汇编。
         # bug2 修复:精确解析地址、**不归函数头**。749 曾给函数内地址 0x400c00 被 _resolve_ea 归到
@@ -189,6 +217,7 @@ def _handle(cmd, a, mods):
                     "fingerprint_feat": _scan_items(mods, items)}
         f = ida_funcs.get_func(exact)
         lines, callees, cseen = [], [], set()
+        more_at = None            # 非空 = 因 count 上限截断,后面还有指令(见下方 note)
         def _collect_callees(at):   # 解析 call/jmp 立即数目标,供模型顺 call 跟进(如 call _main → 真 main)
             for cr in idautils.CodeRefsFrom(at, 0):
                 cfn = ida_funcs.get_func(cr)
@@ -206,8 +235,15 @@ def _handle(cmd, a, mods):
                 lines.append(f"{cur:#x}  {idc.GetDisasm(cur)}")
                 _collect_callees(cur)
                 cur = idc.next_head(cur)
+            # 停在 count 上限而非函数尾 → 后面还有指令,必须说清(否则模型以为看全了就下结论)
+            if cur not in (ida_idaapi.BADADDR, 0) and len(lines) >= n:
+                more_at = hex(int(cur))
         return {"addr": int(exact), "name": idc.get_func_name(exact),
                 "disasm": "\n".join(lines), "callees": callees,
+                **({"more_from": more_at,
+                    "note": f"只反汇编了 {len(lines)} 条就到 count 上限,**后面还有指令**;"
+                            f"续读用 ida_disasm(name_or_addr={more_at}) 或调大 count"}
+                   if more_at else {}),
                 "fingerprint_feat": _fingerprint(mods, exact), "outline": _outline(mods, exact)}
     if cmd == "outline":
         ea = _resolve_ea(idc, ida_funcs, ida_idaapi, a["name_or_addr"])
@@ -329,7 +365,8 @@ def _score_functions(mods, top):
         out.append({"addr": hex(fea), "name": idc.get_func_name(fea),
                     "size": ft["size"], "score": score, "why": why})
     out.sort(key=lambda r: -r["score"])
-    return out[:top]
+    # 带上全库函数总数:只回 top-N 而不说总量,模型会误以为"全部函数就这些"
+    return {"functions": out[:top], "total": len(out), "shown": min(top, len(out))}
 
 
 _XFORM = {"xor", "add", "sub", "shl", "shr", "sar", "rol", "ror",
