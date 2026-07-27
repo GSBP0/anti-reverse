@@ -19,8 +19,12 @@ const el = (tag, cls, text) => {
 // ——— 全局状态 ———
 const S = {
   runId: null, es: null, replay: false,
-  step: 0, round: 0, maxSteps: 15, maxReplan: 0,
+  // maxSteps 初始为 null 而非 15:深链/回放进来时根本不知道该 run 的 max_steps,
+  // 给个默认值会显示出错误的分母(实测 max_steps=8 的 run 被显示成"步 5/15")。
+  step: 0, round: 0, maxSteps: null, maxReplan: 0,
   startedAt: null, budget: null, lastPrefill: null,
+  agentPaused: false,              // agent 是否真的停在检查点上(区别于"暂停请求已下")
+  memWarned: false,                // 内存告警去重:metric 每步都来,不去重会刷满告警区
   funcs: new Set(), reads: new Set(), verified: new Set(),
   alerts: [], pending: null,        // pending: 已收到 executor_output、等 tool_result 的那一步
 };
@@ -35,9 +39,11 @@ function setTop({ state, alive }) {
   const dot = $("state-dot");
   dot.className = "dot" + (state === "paused" ? " paused"
     : (state === "crashed" || state === "stopping") ? " dead" : "");
-  const label = { running: "执行中", paused: "已暂停", stopping: "停止中",
-                  done: "已结束", crashed: "已崩溃", history: "回放",
-                  unknown: "未知" }[state] || state;
+  // paused 分两个阶段:.ctl 已写 paused(请求已下)≠ agent 真的停了。agent 可能还在等
+  // 一次 LLM 调用返回(几十秒),要等它到检查点才算真停 —— 直接显示"已暂停"会误导。
+  const label = { running: "执行中", paused: S.agentPaused ? "已暂停" : "暂停请求中…",
+                  stopping: "停止中", done: "已结束", crashed: "已崩溃",
+                  history: "回放", unknown: "未知" }[state] || state;
   $("t-state").textContent = label;
   $("pause-btn").textContent = state === "paused" ? "继续" : "暂停";
   const off = !alive;
@@ -69,6 +75,23 @@ function truncLines(text, n) {
     : { head: lines.slice(0, n).join("\n"), rest: lines.length - n };
 }
 
+// 真实 agent 的 tool_result.obs 是 **dict** 而不是字符串
+// (ida_decompile → {pseudocode,data_refs,…}、run_python → {stdout,stderr,returncode,…}),
+// 直接交给 truncLines 会渲染成 "[object Object]"、算长度得到 undefined。
+// 这里取主文本字段优先渲染,其余字段以紧凑 JSON 附在后面。
+const OBS_MAIN_KEYS = ["pseudocode", "disasm", "stdout", "text", "output", "content"];
+function obsText(obs) {
+  if (obs == null) return "";
+  if (typeof obs === "string") return obs;
+  if (typeof obs !== "object") return String(obs);
+  const main = OBS_MAIN_KEYS.find((k) => typeof obs[k] === "string" && obs[k].length);
+  if (!main) return JSON.stringify(obs, null, 1);
+  const rest = Object.fromEntries(Object.entries(obs).filter(([k]) => k !== main));
+  const tail = Object.keys(rest).length
+    ? `\n\n── 其余字段 ──\n${JSON.stringify(rest, null, 1)}` : "";
+  return obs[main] + tail;
+}
+
 function callText(tool, args) {
   if (!tool) return "(未调用工具)";
   let a = "";
@@ -94,7 +117,7 @@ function renderFocus(ev) {
 function fillFocusObs(ev) {
   const obs = $("focus-obs");
   if (!obs) return;
-  const { head, rest } = truncLines(ev.obs ?? "", OBS_HEAD_LINES);
+  const { head, rest } = truncLines(obsText(ev.obs), OBS_HEAD_LINES);
   obs.textContent = head;
   const truncated = (ev._truncated || []).includes("obs");
   if (rest || truncated) {
@@ -109,7 +132,7 @@ async function expandFull(seq, obsNode, moreNode) {
   moreNode.textContent = "加载中…";
   try {
     const d = await (await fetch(`/api/runs/${S.runId}/events/${seq}`)).json();
-    obsNode.textContent = d.obs ?? obsNode.textContent;
+    obsNode.textContent = d.obs != null ? obsText(d.obs) : obsNode.textContent;
     moreNode.remove();
   } catch (e) {
     moreNode.textContent = "加载失败:" + e;
@@ -137,7 +160,8 @@ async function toggleDetail(row, ev) {
   row.after(d);
   try {
     const full = await (await fetch(`/api/runs/${S.runId}/events/${ev.seq}`)).json();
-    const { head, rest } = truncLines(full.obs ?? full.error ?? full.plan ?? "(无内容)", OBS_HEAD_LINES);
+    const raw = full.obs ?? full.error ?? full.plan ?? "(无内容)";
+    const { head, rest } = truncLines(obsText(raw), OBS_HEAD_LINES);
     body.textContent = head + (rest ? `\n… 还有 ${rest} 行` : "");
   } catch (e) {
     body.textContent = "加载失败:" + e;
@@ -230,9 +254,12 @@ function onAgentEvent(ev) {
       addAlert(`上下文 ${ev.approx_tokens} token 触顶 → 转 planner 压缩`);
       break;
     case "paused":
-      addAlert("已暂停", false);
+      S.agentPaused = true;                       // 到这里才是真停了(agent 阻塞在检查点上)
+      $("t-state").textContent = "已暂停";
+      addAlert("agent 已在检查点停住", false);
       break;
     case "resumed":
+      S.agentPaused = false;
       addAlert(`已恢复(暂停 ${ev.paused_s}s,时间闸已顺延)`, false);
       break;
     case "stuck_no_progress":
@@ -254,7 +281,7 @@ function onAgentEvent(ev) {
 }
 
 function obsNote(ev) {
-  const n = ev._obs_len ?? (ev.obs ? ev.obs.length : 0);
+  const n = ev._obs_len ?? obsText(ev.obs).length;   // obs 可能是 dict,不能直接取 .length
   return n > 1000 ? `${(n / 1000).toFixed(1)}k 字符` : `${n} 字符`;
 }
 
@@ -269,7 +296,14 @@ function onMetric(m) {
   if (m.tps != null) $("m-tps").textContent = `${m.tps} tps`;
   if (m.mem_pct != null && m.mem_pct >= 0) {
     $("m-mem").textContent = `${m.mem_pct}%`;
-    if (m.mem_pct >= 90) addAlert(`内存 ${m.mem_pct}% —— 小心 mlx 被 swap 拖垮`);
+    // 只在首次越过 90% 时告警;回落到 85% 以下才重新武装。metric 每次 LLM 调用都来,
+    // 不去重会把告警区刷满同一条内存警告(实测连刷 4 条)。
+    if (m.mem_pct >= 90 && !S.memWarned) {
+      S.memWarned = true;
+      addAlert(`内存 ${m.mem_pct}% —— 小心 mlx 被 swap 拖垮`);
+    } else if (m.mem_pct < 85) {
+      S.memWarned = false;
+    }
   }
 }
 
@@ -433,6 +467,7 @@ function showLaunch() {
 
 function resetState() {
   S.step = 0; S.round = 0; S.startedAt = null; S.pending = null; S.lastPrefill = null;
+  S.maxSteps = null; S.agentPaused = false; S.memWarned = false;
   S.funcs.clear(); S.reads.clear(); S.verified.clear(); S.alerts = [];
   $("history-list").innerHTML = "";
   $("focus").innerHTML = '<div class="label">等待第一步…</div>';

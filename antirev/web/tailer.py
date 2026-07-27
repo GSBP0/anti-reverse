@@ -13,6 +13,32 @@ OBS_LIMIT = 2048          # 摘要上限:**字符**数(不是字节 —— 中�
 TRUNC_KEYS = ("obs", "plan", "thought", "hint", "error", "summary", "ledger", "decompiles")
 
 
+def _trunc_value(v, limit: int):
+    """截断任意结构里的长字符串,返回 (新值, 原始字符总数)。
+
+    必须递归:真实 agent 的 tool_result.obs **是 dict 而非字符串**
+    (`ida_decompile` → {'pseudocode':…,'data_refs':…}、`run_python` → {'stdout':…,'stderr':…}),
+    只判 isinstance(v, str) 会让 dict 型 obs 完全绕过截断 —— 等于没有体积上限。
+    保留结构不整体序列化,因为前端要靠 key 名决定怎么渲染。
+    """
+    if isinstance(v, str):
+        return (v[:limit] if len(v) > limit else v), len(v)
+    if isinstance(v, dict):
+        out, total = {}, 0
+        for k, sub in v.items():
+            out[k], n = _trunc_value(sub, limit)
+            total += n
+        return out, total
+    if isinstance(v, list):
+        out, total = [], 0
+        for sub in v:
+            nv, n = _trunc_value(sub, limit)
+            out.append(nv)
+            total += n
+        return out, total
+    return v, 0
+
+
 class JsonlTailer:
     """一个文件一个实例,记住已消费的字节位置。非线程安全(每个 SSE 连接独立持有)。"""
 
@@ -62,11 +88,13 @@ class JsonlTailer:
             return None                 # 坏行跳过但占用 seq,保证 seq 恒等于真实行号
         ev = {"seq": seq, **rec}
         for k in TRUNC_KEYS:
-            v = ev.get(k)
-            if isinstance(v, str) and len(v) > self.obs_limit:
-                ev[k] = v[: self.obs_limit]
+            if k not in ev:
+                continue
+            newv, total = _trunc_value(ev[k], self.obs_limit)
+            if total > self.obs_limit:
+                ev[k] = newv
                 ev.setdefault("_truncated", []).append(k)
-                ev[f"_{k}_len"] = len(v)
+                ev[f"_{k}_len"] = total      # 原始字符总数(dict 型是内部所有字符串之和)
         return ev
 
 

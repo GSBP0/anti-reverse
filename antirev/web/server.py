@@ -93,8 +93,10 @@ def list_runs():
 @app.post("/api/runs")
 def start_run(req: StartReq):
     binary = Path(req.binary).expanduser()
-    if not binary.exists():
-        raise HTTPException(400, f"二进制不存在: {req.binary}")
+    # 必须 is_file 而不是 exists:空字符串的 Path 是 ".",而目录是"存在"的 —— 用 exists 会让
+    # 空 binary 一路放行到 solve_one,起一个注定失败的子进程(实测踩过)。
+    if not binary.is_file():
+        raise HTTPException(400, f"二进制不存在或不是文件: {req.binary}")
     _safe_path(str(binary))
     active = runner.active_run_ids()
     if active and not req.force:
