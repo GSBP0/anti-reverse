@@ -53,6 +53,7 @@ def _log_tps(usage, finish_reason, wall_s, n_msgs):
         pass
 
 from antirev import config
+from antirev import ctl
 from antirev import knowledge
 from antirev.memory.store import MemoryStore, _canon
 from antirev.memory.context import ContextManager, _brief_args
@@ -573,6 +574,9 @@ class ReactExecutor:
         self._progress["explore_n"] = 0   # 每轮重置"连续纯探索"计数(新plan新方向,给机会)
         try:
             for step in range(1, self.max_steps + 1):
+                # 步开头控制检查点(Web 暂停/停止)。暂停时长加回 start,免得暂停被算进
+                # time_budget;progress 里的 stuck 基准与全局 deadline 由 checkpoint 自己顺延。
+                start += ctl.checkpoint(self.run_id, self._progress, self.logger)
                 if self.time_budget and time.time() - start > self.time_budget:
                     self._log("time_budget_exceeded", step=step)
                     return self._fail(ctx, step, "超时间预算")
@@ -634,6 +638,9 @@ class ReactExecutor:
                     # has_content 埋点:统计原生模式下 content(强制 THOUGHT)非空率,监测推理链是否真被保留
                     self._log("executor_output", step=step, thought=thought, tool=tool, args=args,
                               has_content=bool((resp.get("content") or "").strip()), ctx_msgs=len(messages))
+                    # 决策后检查点:此刻前端已收到 thought/tool/args,人可在工具真正执行前拦住
+                    # (IDA 分析一次 180s,拦在这里比拦在下一步开头省得多)。
+                    start += ctl.checkpoint(self.run_id, self._progress, self.logger)
                     # —— B1 轮内断环守卫(仅拦 action;final/none 各有既有处理)——
                     if kind == "action":
                         loop = self._progress.setdefault("loop", {"sig": None, "tool": None, "nth": "", "n": 0})
