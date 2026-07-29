@@ -15,6 +15,11 @@ data/
 docs/
 scripts/
 tests/
+# 题库清单(NSSCTF 抓取产物,同 data/ 另行分发)与设计文档
+nssctf_reverse_problems.csv
+nssctf_reverse_problems.json
+nssctf_reverse_problems.md
+plan1.md
 
 # 第三方仓库克隆(独立 git 仓库,与本项目无关)
 grok-build/
