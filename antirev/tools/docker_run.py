@@ -38,9 +38,12 @@ def _select(data: bytes):
         machine = int.from_bytes(data[18:20], "little")
         plat = _ELF_PLATFORM.get(machine)
         if plat:
-            # 用本地大概率已有的 debian:12(免拉 stable-slim,国内 registry 常不通);
+            # 多候选:本地有哪个用哪个,都没有再逐个尝试拉。单一镜像时一旦本地被清掉
+            # 且 registry 不通,ELF 实跑就整个失效(用户误删镜像后实际发生过)。
             # amd64 经 docker 的 Rosetta/QEMU 可在 arm64 主机跨架构跑(实测 uname -m=x86_64)
-            return ("ELF", plat, "debian:12", _ELF_RUNCMD)
+            return ("ELF", plat,
+                    ("debian:12", "debian:stable-slim", "ubuntu:22.04", "ubuntu:20.04", "busybox:1.36"),
+                    _ELF_RUNCMD)
     return (None, None, None, None)
 
 
